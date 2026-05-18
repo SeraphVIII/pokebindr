@@ -1,0 +1,38 @@
+{
+  "expo": {
+    "name": "Pokémon Tracker",
+    "slug": "poketracker",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "pokemontracker",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.yourname.pokemontracker"
+    },
+    "android": {
+      "package": "com.yourname.pokemontracker",
+      "adaptiveIcon": {
+        "backgroundColor": "#0c0a08"
+      }
+    },
+    "web": {
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-font"
+    ],
+    "experiments": {
+      "typedRoutes": false
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "9f92141e-0151-47c3-981d-ac78231a972b"
+      }
+    },
+    "owner": "achilyss-organization"
+  }
+}
