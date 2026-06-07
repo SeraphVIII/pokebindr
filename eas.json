@@ -1,0 +1,36 @@
+{
+  "cli": {
+    "version": ">= 18.13.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_SUPABASE_URL": "https://troqnsphlwykeazffoxa.supabase.co",
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "sb_publishable_cwoxp0SYi3RhUJeanq3DOg_Bn80gJMY",
+        "EXPO_PUBLIC_POKEMONTCG_API_KEY": "47afdbf2-7a28-4220-805b-23cd46630da7"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_SUPABASE_URL": "https://troqnsphlwykeazffoxa.supabase.co",
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "sb_publishable_cwoxp0SYi3RhUJeanq3DOg_Bn80gJMY",
+        "EXPO_PUBLIC_POKEMONTCG_API_KEY": "47afdbf2-7a28-4220-805b-23cd46630da7"
+      }
+    },
+    "production": {
+      "autoIncrement": true,
+      "env": {
+        "EXPO_PUBLIC_SUPABASE_URL": "https://troqnsphlwykeazffoxa.supabase.co",
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "sb_publishable_cwoxp0SYi3RhUJeanq3DOg_Bn80gJMY",
+        "EXPO_PUBLIC_POKEMONTCG_API_KEY": "47afdbf2-7a28-4220-805b-23cd46630da7"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

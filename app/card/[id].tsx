@@ -1,54 +1,64 @@
 // Card detail — opens for any card_id. Pulls live data from PokemonTCG.io.
 //
 // If the card is NOT yet in any binder, shows an "Add to: BinderX" button
-// (BinderX = last-used binder). The binder name is itself tappable; it
-// opens a bottom-anchored picker (40% of screen height).
+// (BinderX = the first binder, typically "My Collection" / the bulk binder).
+// The binder name is itself tappable; it opens a bottom-anchored picker
+// (40% of screen height). The picker selection lives only for the current
+// screen — it's intentionally NOT persisted across cards or sessions, so the
+// add flow stays a generic "drop it in your default binder unless you pick".
 //
 // If the card IS in a binder, shows status pills and a trash icon to remove.
 
 import { useState, useMemo } from 'react';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import {
-  View, Text, ScrollView, Image, Pressable, Alert, ActivityIndicator,
-  useWindowDimensions, Modal, Linking,
+  View, Text, ScrollView, Image, Pressable, ActivityIndicator,
+  useWindowDimensions, Modal,
 } from 'react-native';
+import * as WebBrowser from 'expo-web-browser';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Feather } from '@expo/vector-icons';
 import { Screen } from '@/components/Screen';
 import { Eyebrow } from '@/components/Eyebrow';
 import { Chip } from '@/components/Chip';
 import { Sparkline } from '@/components/Sparkline';
+import { useToast } from '@/components/Toast';
+import { useConfirm } from '@/components/ConfirmDialog';
+import { useContentWidth } from '@/lib/layout';
 import {
   useCollectionItem, useCollectionRowById, useCollectionItemsByCardId,
   useTcgCard, useSetStatus, useRemoveCard, useBinders, useUpsertCard,
-  useUpdateCardRow,
+  useUpdateCardRow, useCardmarketUrl,
 } from '@/lib/queries';
-import { useLastBinder } from '@/lib/lastBinder';
 import { theme } from '@/lib/theme';
 import type { Status, Binder, TcgCard, CollectionRow } from '@/lib/types';
 
 const CONDITIONS = ['NM', 'EX', 'GD', 'LP', 'MP', 'HP'] as const;
 
-// Open Cardmarket's search page for this card, English-only.
-//
-// Earlier attempts (?idProduct=…, resolving the tracker via fetch) ran into
-// Cardmarket's anti-bot 403s and inconsistent redirect behaviour. The plain
-// search URL is rock-solid: takes a card name, returns a page of products
-// the user can click through to, and `language=1` survives the URL.
-function openCardmarket(card: { name: string }) {
-  const q = encodeURIComponent(card.name);
-  const url = `https://www.cardmarket.com/en/Pokemon/Products/Search?searchString=${q}&language=1`;
-  Linking.openURL(url);
+// Open Cardmarket for this card. The URL is resolved server-side by the
+// cardmarket-resolve Edge Function (DDG !ducky lookup + ?language=1 appended)
+// and held in React Query; tapping the button just opens whatever the
+// cache holds. WebBrowser sidesteps Android's intent-dispatch quirks.
+async function openCardmarket(url: string | undefined, onError: (msg: string) => void) {
+  try {
+    if (!url) throw new Error('Still resolving Cardmarket link…');
+    await WebBrowser.openBrowserAsync(url);
+  } catch (e: any) {
+    onError(e?.message ?? 'Could not open Cardmarket');
+  }
 }
 
 export default function CardDetail() {
   // `id` = PokemonTCG.io card id. Optional `row` query param identifies
   // a specific user-owned instance (since the same card_id can appear
   // multiple times in a binder).
-  const { id, row: rowParam } = useLocalSearchParams<{ id: string; row?: string }>();
+  const { id, row: rowParam, lang } = useLocalSearchParams<{ id: string; row?: string; lang?: string }>();
+  const locale: 'en' | 'ja' = lang === 'ja' ? 'ja' : 'en';
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { data: card, isLoading: loadingCard, error: cardError } = useTcgCard(id);
+  const toast = useToast();
+  const confirm = useConfirm();
+  const { data: card, isLoading: loadingCard, error: cardError } = useTcgCard(id, locale);
   // If a row is specified, look it up directly. Otherwise the user came
   // from a context that doesn't know about a specific instance (e.g. search)
   // — show info-only with an Add button.
@@ -65,25 +75,28 @@ export default function CardDetail() {
   const remove = useRemoveCard();
   const upsert = useUpsertCard();
   const updateRow = useUpdateCardRow();
-  const { lastBinderId, setLastBinder } = useLastBinder();
-  const { width: winW, height: winH } = useWindowDimensions();
+  const { height: winH } = useWindowDimensions();
+  const winW = useContentWidth();
   const sparkW = Math.max(160, winW - (24 + 16) * 2);
 
   const [pickerOpen, setPickerOpen] = useState(false);
   const [chosenBinderId, setChosenBinderId] = useState<string | null>(null);
 
-  // Default the picker selection: whatever the user last used; otherwise
-  // the first binder they have.
+  // Default the picker selection to the first binder (typically the bulk
+  // "My Collection" binder). Per-screen explicit picks override; no
+  // cross-card / cross-session memory of the last binder used.
   const targetBinderId = useMemo(() => {
     if (chosenBinderId && binders.some((b) => b.id === chosenBinderId)) return chosenBinderId;
-    if (lastBinderId && binders.some((b) => b.id === lastBinderId)) return lastBinderId;
     return binders[0]?.id ?? null;
-  }, [chosenBinderId, lastBinderId, binders]);
+  }, [chosenBinderId, binders]);
   const targetBinder = binders.find((b) => b.id === targetBinderId) ?? null;
 
   // All hooks must run on every render; compute fallback off card?. so the
   // hook runs even while `card` is loading.
   const tcgFallback = useMemo(() => pickTcgplayerPrice(card?.tcgplayer), [card?.tcgplayer]);
+  // Pre-resolve the Cardmarket URL while the user is reading the page so
+  // tapping the button is instant. Hook safely no-ops while `card` is null.
+  const { data: cmUrl, isLoading: cmLoading } = useCardmarketUrl(card);
 
   if (loadingCard) {
     return (
@@ -122,8 +135,12 @@ export default function CardDetail() {
   const currency = usingCM ? '€' : '$';
   const priceSource = usingCM ? 'Cardmarket · EU' : tcgFallback ? 'TCGplayer · US' : null;
 
+  // Approximate trend over the past month using progressively shorter rolling
+  // windows ending at "now". Not a real time series (each value is an average
+  // of an overlapping window, not a price at a point in time), so the chart
+  // is suggestive of direction only. Replace once V2 price_snapshots land.
   const series = (usingCM
-    ? [prices?.avg30, prices?.avg30, prices?.avg7, prices?.avg7, prices?.avg1, prices?.trendPrice]
+    ? [prices?.avg30, prices?.avg7, prices?.avg1, prices?.trendPrice]
     : [tcgFallback?.low, tcgFallback?.mid, tcgFallback?.market, tcgFallback?.high]
   ).filter((n): n is number => typeof n === 'number');
 
@@ -132,38 +149,39 @@ export default function CardDetail() {
     try {
       await setStatus.mutateAsync({ rowId: row.id, status: s });
     } catch (e: any) {
-      Alert.alert('Error', e.message);
+      toast.error(e.message ?? 'Could not update status');
     }
   };
 
-  const removeFromBinder = () => {
+  const removeFromBinder = async () => {
     if (!row) return;
-    Alert.alert('Remove from binder?', card.name, [
-      { text: 'Cancel', style: 'cancel' },
-      { text: 'Remove', style: 'destructive',
-        onPress: async () => { await remove.mutateAsync(row.id); router.back(); } },
-    ]);
+    const ok = await confirm({
+      title: 'Remove from binder?',
+      message: card.name,
+      confirmText: 'Remove',
+      destructive: true,
+    });
+    if (!ok) return;
+    await remove.mutateAsync(row.id);
+    router.back();
   };
 
   const handleAdd = async () => {
     if (!targetBinder) {
-      Alert.alert(
-        'No binders yet',
-        'Create a binder first.',
-        [
-          { text: 'Cancel', style: 'cancel' },
-          { text: 'Create binder', onPress: () => router.push('/binder/new') },
-        ],
-      );
+      const ok = await confirm({
+        title: 'No binders yet',
+        message: 'Create a binder first.',
+        confirmText: 'Create binder',
+      });
+      if (ok) router.navigate('/binder/new');
       return;
     }
     try {
       await upsert.mutateAsync({ card, status: 'have', binderId: targetBinder.id });
-      await setLastBinder(targetBinder.id);
       // Stay in aggregate mode so the stepper can keep accumulating copies.
       // The "Your copies" breakdown below the stepper updates automatically.
     } catch (e: any) {
-      Alert.alert('Could not add', e.message ?? 'Unknown error');
+      toast.error(e.message ?? 'Could not add card');
     }
   };
 
@@ -180,13 +198,12 @@ export default function CardDetail() {
     try {
       await remove.mutateAsync(last.id);
     } catch (e: any) {
-      Alert.alert('Could not remove', e.message ?? 'Unknown error');
+      toast.error(e.message ?? 'Could not remove card');
     }
   };
 
-  const choose = async (b: Binder) => {
+  const choose = (b: Binder) => {
     setChosenBinderId(b.id);
-    await setLastBinder(b.id);
     setPickerOpen(false);
   };
 
@@ -221,7 +238,7 @@ export default function CardDetail() {
           </Eyebrow>
           <Text style={{
             fontFamily: theme.fontDisplay,
-            fontSize: 32, color: theme.text, marginTop: 4, lineHeight: 34,
+            fontSize: 32, color: theme.text, marginTop: 4, lineHeight: 42,
           }}>{card.name}</Text>
           {card.hp && (
             <Text style={{ color: theme.textDim, fontSize: 13, marginTop: 6 }}>
@@ -365,15 +382,21 @@ export default function CardDetail() {
         {card.name && (
           <View style={{ paddingHorizontal: 24, marginTop: 16 }}>
             <Pressable
-              onPress={() => openCardmarket(card)}
+              onPress={() => openCardmarket(cmUrl, toast.error)}
+              disabled={cmLoading}
               style={{
                 flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
                 gap: 8,
                 paddingVertical: 14,
                 borderWidth: 1, borderColor: theme.borderStrong,
                 borderRadius: theme.radius,
+                opacity: cmLoading ? 0.6 : 1,
               }}>
-              <Feather name="external-link" size={14} color={theme.accent} />
+              {cmLoading ? (
+                <ActivityIndicator color={theme.accent} size="small" />
+              ) : (
+                <Feather name="external-link" size={14} color={theme.accent} />
+              )}
               <Text style={{
                 color: theme.accent, fontSize: 13,
                 fontFamily: theme.fontUIBold, letterSpacing: 0.5,
@@ -392,12 +415,13 @@ export default function CardDetail() {
         navigationBarTranslucent
         onRequestClose={() => setPickerOpen(false)}
       >
-        <View style={{ flex: 1, justifyContent: 'flex-end' }}>
+        <View style={{ flex: 1, justifyContent: 'flex-end', alignItems: 'center' }}>
           <Pressable
             onPress={() => setPickerOpen(false)}
-            style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.6)' }}
+            style={{ flex: 1, alignSelf: 'stretch', backgroundColor: 'rgba(0,0,0,0.6)' }}
           />
           <View style={{
+            width: '100%', maxWidth: theme.maxContentW,
             height: winH * 0.4 + insets.bottom,
             backgroundColor: theme.surface,
             borderTopLeftRadius: theme.radius * 2,
@@ -624,14 +648,20 @@ function PriceRow({ label, value, currency }: { label: string; value: number; cu
   return (
     <View style={{
       flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-      padding: 12,
+      paddingVertical: 12, paddingRight: 14, paddingLeft: 14,
       backgroundColor: theme.surface,
       borderWidth: 1, borderColor: theme.border,
+      // Gold left edge frames each row as a museum label — also mirrors the
+      // Toast component's stripe so the price table feels part of the system.
+      borderLeftWidth: 3, borderLeftColor: theme.accent2,
       borderRadius: theme.radius,
     }}>
-      <Text style={{ color: theme.text, fontSize: 13 }}>{label}</Text>
       <Text style={{
-        color: theme.text, fontSize: 13.5, fontWeight: '600',
+        color: theme.textDim, fontSize: 12, fontFamily: theme.fontMono,
+        letterSpacing: 0.5, textTransform: 'uppercase',
+      }}>{label}</Text>
+      <Text style={{
+        color: theme.text, fontSize: 14, fontWeight: '600',
         fontFamily: theme.fontMono,
       }}>{currency}{value.toFixed(2)}</Text>
     </View>

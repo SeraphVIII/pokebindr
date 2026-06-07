@@ -24,6 +24,11 @@ export const theme = {
   cardBg: '#1a1611',
   radius: 8,
 
+  // Maximum content width — keeps the grid + reading column phone-sized on
+  // wide desktop browsers. Anything narrower than this is full-width; wider
+  // and we letterbox the app in the centre of the viewport.
+  maxContentW: 480,
+
   // Font families — Google Fonts, loaded in app/_layout.tsx via useFonts.
   // Cormorant Garamond carries the "museum" feel for hero numbers and
   // titles; Manrope is the geometric humanist body face; JetBrains Mono

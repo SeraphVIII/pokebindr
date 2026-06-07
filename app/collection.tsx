@@ -5,7 +5,7 @@
 
 import { useMemo, useState } from 'react';
 import {
-  ScrollView, View, Text, Pressable, Image, RefreshControl, Alert,
+  ScrollView, View, Text, Pressable, Image, RefreshControl, TextInput,
 } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
@@ -14,6 +14,7 @@ import { Screen } from '@/components/Screen';
 import { Eyebrow } from '@/components/Eyebrow';
 import { Chip } from '@/components/Chip';
 import { useCollection, useBinders, useRemoveCards } from '@/lib/queries';
+import { useConfirm } from '@/components/ConfirmDialog';
 import { theme } from '@/lib/theme';
 
 type Sort = 'recent' | 'name' | 'set' | 'price';
@@ -47,6 +48,7 @@ export default function MyCollection() {
   const { data: rows = [] } = useCollection();
   const { data: binders = [] } = useBinders();
   const removeCards = useRemoveCards();
+  const confirm = useConfirm();
   const [sort, setSort] = useState<Sort>('recent');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>(() => {
     if (statusParam === 'have' || statusParam === 'want' || statusParam === 'really') {
@@ -55,29 +57,24 @@ export default function MyCollection() {
     return 'all';
   });
   const [refreshing, setRefreshing] = useState(false);
+  const [search, setSearch] = useState('');
   // Selection mode toggles between "open detail" and "select card_id" on tap.
   const [selecting, setSelecting] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
 
-  const onBulkDelete = () => {
+  const onBulkDelete = async () => {
     if (selected.size === 0) return;
     const ids = rows.filter((r) => selected.has(r.card_id)).map((r) => r.id);
-    Alert.alert(
-      `Remove ${selected.size} ${selected.size === 1 ? 'card' : 'cards'}?`,
-      `This deletes all ${ids.length} ${ids.length === 1 ? 'instance' : 'instances'} from your collection.`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Remove',
-          style: 'destructive',
-          onPress: async () => {
-            await removeCards.mutateAsync(ids);
-            setSelected(new Set());
-            setSelecting(false);
-          },
-        },
-      ],
-    );
+    const ok = await confirm({
+      title: `Remove ${selected.size} ${selected.size === 1 ? 'card' : 'cards'}?`,
+      message: `This deletes all ${ids.length} ${ids.length === 1 ? 'instance' : 'instances'} from your collection.`,
+      confirmText: 'Remove',
+      destructive: true,
+    });
+    if (!ok) return;
+    await removeCards.mutateAsync(ids);
+    setSelected(new Set());
+    setSelecting(false);
   };
 
   const onRefresh = async () => {
@@ -134,11 +131,23 @@ export default function MyCollection() {
     }
   }, [grouped, sort]);
 
-  // Status filter applied AFTER sort so chips don't disturb existing order.
+  // Status filter + search applied AFTER sort so chips don't disturb existing
+  // order. Search matches on name + set name + card number (case-insensitive).
   const visible = useMemo(() => {
-    if (statusFilter === 'all') return sorted;
-    return sorted.filter((g) => g.statuses.has(statusFilter));
-  }, [sorted, statusFilter]);
+    let out = sorted;
+    if (statusFilter !== 'all') {
+      out = out.filter((g) => g.statuses.has(statusFilter));
+    }
+    const term = search.trim().toLowerCase();
+    if (term) {
+      out = out.filter((g) =>
+        g.card_name.toLowerCase().includes(term)
+        || g.set_name.toLowerCase().includes(term)
+        || g.card_number.toLowerCase().includes(term),
+      );
+    }
+    return out;
+  }, [sorted, statusFilter, search]);
 
   const totalValue = rows.reduce((s, r) => s + (r.last_price_eur ?? 0), 0);
 
@@ -147,7 +156,7 @@ export default function MyCollection() {
       {selecting ? (
         <View style={{
           flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-          paddingHorizontal: 14, paddingTop: 6,
+          paddingHorizontal: 14, paddingTop: 6, gap: 8,
         }}>
           <Pressable
             onPress={() => { setSelecting(false); setSelected(new Set()); }}
@@ -161,13 +170,35 @@ export default function MyCollection() {
             color: theme.text, fontFamily: theme.fontMono, fontSize: 12,
             letterSpacing: 1.5, textTransform: 'uppercase',
           }}>{selected.size} selected</Text>
-          <Pressable onPress={onBulkDelete} disabled={selected.size === 0} hitSlop={12}>
-            <Text style={{
-              color: selected.size === 0 ? theme.textMute : theme.statusReally,
-              fontFamily: theme.fontUIBold,
-              fontSize: 13, letterSpacing: 0.5, textTransform: 'uppercase',
-            }}>Delete</Text>
-          </Pressable>
+          <View style={{ flexDirection: 'row', gap: 14 }}>
+            {(() => {
+              const allSelected =
+                visible.length > 0 && visible.every((g) => selected.has(g.card_id));
+              return (
+                <Pressable
+                  onPress={() => {
+                    if (allSelected) setSelected(new Set());
+                    else setSelected(new Set(visible.map((g) => g.card_id)));
+                  }}
+                  disabled={visible.length === 0}
+                  hitSlop={12}
+                >
+                  <Text style={{
+                    color: visible.length === 0 ? theme.textMute : theme.accent,
+                    fontFamily: theme.fontUIBold,
+                    fontSize: 13, letterSpacing: 0.5, textTransform: 'uppercase',
+                  }}>{allSelected ? 'None' : 'All'}</Text>
+                </Pressable>
+              );
+            })()}
+            <Pressable onPress={onBulkDelete} disabled={selected.size === 0} hitSlop={12}>
+              <Text style={{
+                color: selected.size === 0 ? theme.textMute : theme.statusReally,
+                fontFamily: theme.fontUIBold,
+                fontSize: 13, letterSpacing: 0.5, textTransform: 'uppercase',
+              }}>Delete</Text>
+            </Pressable>
+          </View>
         </View>
       ) : (
         <View style={{
@@ -189,8 +220,36 @@ export default function MyCollection() {
         </Eyebrow>
         <Text style={{
           fontFamily: theme.fontDisplay,
-          fontSize: 30, color: theme.text, marginTop: 4,
+          fontSize: 30, color: theme.text, marginTop: 4, lineHeight: 40,
         }}>My Collection</Text>
+      </View>
+
+      <View style={{ paddingHorizontal: 24, paddingTop: 14 }}>
+        <View style={{
+          flexDirection: 'row', alignItems: 'center', gap: 10,
+          backgroundColor: theme.surface,
+          borderWidth: 1, borderColor: theme.border,
+          borderRadius: theme.radius,
+          paddingHorizontal: 14, paddingVertical: 8,
+        }}>
+          <Feather name="search" size={16} color={theme.textDim} />
+          <TextInput
+            value={search}
+            onChangeText={setSearch}
+            placeholder="Name, set, or number…"
+            placeholderTextColor={theme.textMute}
+            autoCapitalize="none"
+            style={{
+              flex: 1, color: theme.text, fontSize: 14,
+              paddingVertical: 4,
+            }}
+          />
+          {search.length > 0 && (
+            <Pressable onPress={() => setSearch('')} hitSlop={6}>
+              <Feather name="x" size={16} color={theme.textDim} />
+            </Pressable>
+          )}
+        </View>
       </View>
 
       <View style={{

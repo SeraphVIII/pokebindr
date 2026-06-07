@@ -10,15 +10,15 @@
 import { useState, useEffect, useMemo } from 'react';
 import {
   View, Text, TextInput, FlatList, Pressable,
-  ActivityIndicator, Image, Alert,
+  ActivityIndicator, Image,
 } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
 import { Screen } from '@/components/Screen';
 import { Eyebrow } from '@/components/Eyebrow';
 import { useSearch, useUpsertCard, useSets, useCollection, TcgdexBrief } from '@/lib/queries';
+import { useToast } from '@/components/Toast';
 import { getCard } from '@/lib/tcgdex';
-import { useLastBinder } from '@/lib/lastBinder';
 import { theme } from '@/lib/theme';
 
 export default function Lookup() {
@@ -31,17 +31,32 @@ export default function Lookup() {
   const [q, setQ] = useState('');
   const [debounced, setDebounced] = useState('');
   const router = useRouter();
-  const { setLastBinder } = useLastBinder();
 
   useEffect(() => {
     const t = setTimeout(() => setDebounced(q), 250);
     return () => clearTimeout(t);
   }, [q]);
 
-  const { data: results = [], isLoading, isFetching } = useSearch(debounced);
+  const {
+    data: searchData,
+    isLoading,
+    isFetching,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = useSearch(debounced);
   const { data: sets = [] } = useSets();
   const { data: owned = [] } = useCollection();
   const upsert = useUpsertCard();
+  const toast = useToast();
+
+  // useInfiniteQuery returns paged data; flatten the items into a single
+  // list for the FlatList. Memoized so the FlatList doesn't see a fresh
+  // array identity on unrelated renders. Order is TCGdex's default.
+  const results = useMemo(
+    () => searchData?.pages.flatMap((p) => p.items) ?? [],
+    [searchData],
+  );
 
   const setName = useMemo(() => {
     const m = new Map<string, string>();
@@ -72,14 +87,13 @@ export default function Lookup() {
           binderId,
           position: Number.isFinite(positionOverride) ? positionOverride : undefined,
         });
-        await setLastBinder(binderId);
         // Pop back to the binder that opened us — the binder's tab state
         // is preserved across the trip so the user lands on the same page.
         // (Using router.replace to /binder/[id] left the binder URL on the
         // Lookup tab's stack, which broke the back arrow inside the binder.)
         router.back();
       } catch (e: any) {
-        Alert.alert('Could not add', e.message ?? 'Unknown error');
+        toast.error(e.message ?? 'Could not add card');
       } finally {
         setBusyCardId(null);
       }
@@ -90,41 +104,64 @@ export default function Lookup() {
 
   return (
     <Screen>
-      <View style={{ padding: 16, paddingBottom: 8 }}>
-        {binderId && (
-          <Text style={{
-            color: theme.textDim, fontSize: 11, fontFamily: theme.fontMono,
-            letterSpacing: 1.5, textTransform: 'uppercase',
-            paddingHorizontal: 8, paddingBottom: 8,
+      <View style={{ padding: 24, paddingBottom: 12 }}>
+        <Eyebrow>{binderId ? 'Adding to current binder' : 'TCGdex search'}</Eyebrow>
+      </View>
+
+      <View style={{ paddingHorizontal: 24, paddingBottom: 8 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+          <View style={{
+            flex: 1,
+            flexDirection: 'row', alignItems: 'center', gap: 10,
+            backgroundColor: theme.surface,
+            borderWidth: 1, borderColor: theme.border,
+            borderRadius: theme.radius,
+            paddingHorizontal: 14, paddingVertical: 8,
           }}>
-            Adding to current binder
-          </Text>
-        )}
-        <View style={{
-          flexDirection: 'row', alignItems: 'center', gap: 10,
-          backgroundColor: theme.surface,
-          borderWidth: 1, borderColor: theme.border,
-          borderRadius: theme.radius,
-          paddingHorizontal: 14, paddingVertical: 8,
-        }}>
-          <Feather name="search" size={16} color={theme.textDim} />
-          <TextInput
-            value={q}
-            onChangeText={setQ}
-            placeholder="Name, set, dex #..."
-            placeholderTextColor={theme.textMute}
-            autoFocus
-            autoCapitalize="none"
+            <Feather name="search" size={16} color={theme.textDim} />
+            <TextInput
+              value={q}
+              onChangeText={setQ}
+              // "rayquaza" → name search; "rayquaza 194" → name + collector
+              // number filter; bare "194" → all cards numbered 194 across sets.
+              placeholder="Name, or name + #194…"
+              placeholderTextColor={theme.textMute}
+              autoFocus
+              autoCapitalize="none"
+              style={{
+                flex: 1, color: theme.text, fontSize: 14,
+                paddingVertical: 4,
+              }}
+            />
+            {q.length > 0 && (
+              <Pressable onPress={() => setQ('')}>
+                <Feather name="x" size={16} color={theme.textDim} />
+              </Pressable>
+            )}
+          </View>
+          {/* Scan is available in both flows: in the global flow it hands off
+              to /card/[id]; in the in-binder flow we forward the binder slot
+              so /scan can upsert directly into it via the same useUpsertCard
+              call this screen uses. */}
+          <Pressable
+            onPress={() => router.push({
+              pathname: '/scan',
+              params: {
+                ...(binderId ? { binderId } : null),
+                ...(position != null ? { position } : null),
+                ...(page != null ? { page } : null),
+              },
+            })}
+            accessibilityRole="button"
+            accessibilityLabel="Scan a card with the camera"
             style={{
-              flex: 1, color: theme.text, fontSize: 14,
-              paddingVertical: 4,
-            }}
-          />
-          {q.length > 0 && (
-            <Pressable onPress={() => setQ('')}>
-              <Feather name="x" size={16} color={theme.textDim} />
-            </Pressable>
-          )}
+              width: 42, height: 42, borderRadius: 21,
+              alignItems: 'center', justifyContent: 'center',
+              borderWidth: 1, borderColor: theme.borderStrong,
+              backgroundColor: theme.surface,
+            }}>
+            <Feather name="camera" size={18} color={theme.accent} />
+          </Pressable>
         </View>
       </View>
 
@@ -141,14 +178,33 @@ export default function Lookup() {
         keyboardShouldPersistTaps="handled"
         contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 24 }}
         ItemSeparatorComponent={() => <View style={{ height: 1, backgroundColor: theme.border, marginLeft: 70 }} />}
+        onEndReachedThreshold={0.6}
+        onEndReached={() => {
+          // Guard against React Query firing fetchNextPage redundantly while
+          // a fetch is already in flight; also no-op once we've hit the tail.
+          if (hasNextPage && !isFetchingNextPage) fetchNextPage();
+        }}
+        ListFooterComponent={
+          isFetchingNextPage ? (
+            <View style={{ paddingVertical: 18, alignItems: 'center' }}>
+              <ActivityIndicator color={theme.accent} size="small" />
+            </View>
+          ) : !hasNextPage && results.length > 0 ? (
+            <Text style={{
+              color: theme.textMute, fontSize: 11, fontFamily: theme.fontMono,
+              textAlign: 'center', paddingVertical: 18, letterSpacing: 1,
+              textTransform: 'uppercase',
+            }}>End of results</Text>
+          ) : null
+        }
         ListEmptyComponent={
           isLoading ? (
             <View style={{ padding: 40, alignItems: 'center' }}>
               <ActivityIndicator color={theme.accent} />
             </View>
-          ) : debounced.length < 2 ? (
+          ) : debounced.trim().length === 0 ? (
             <Text style={{ color: theme.textDim, textAlign: 'center', padding: 40, fontSize: 13 }}>
-              Type a card name to search.
+              Type a card name or number to search.
             </Text>
           ) : (
             <Text style={{ color: theme.textDim, textAlign: 'center', padding: 40, fontSize: 13 }}>

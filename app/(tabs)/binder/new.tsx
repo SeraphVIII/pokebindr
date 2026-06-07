@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import {
-  View, Text, TextInput, Pressable, ScrollView, Alert,
+  View, Text, TextInput, Pressable, ScrollView,
   KeyboardAvoidingView, Platform,
 } from 'react-native';
 import { useRouter } from 'expo-router';
@@ -10,6 +10,7 @@ import { Feather } from '@expo/vector-icons';
 import { Screen } from '@/components/Screen';
 import { Eyebrow } from '@/components/Eyebrow';
 import { useCreateBinder } from '@/lib/queries';
+import { useToast } from '@/components/Toast';
 import { theme } from '@/lib/theme';
 
 const SIZES: { label: string; cols: number; rows: number }[] = [
@@ -23,6 +24,7 @@ const SIZES: { label: string; cols: number; rows: number }[] = [
 export default function NewBinder() {
   const router = useRouter();
   const create = useCreateBinder();
+  const toast = useToast();
   const [name, setName] = useState('');
   const [sizeIdx, setSizeIdx] = useState(2); // 3×3 default
   const [pages, setPages] = useState('1');
@@ -30,7 +32,7 @@ export default function NewBinder() {
   const submit = async () => {
     const trimmedName = name.trim();
     if (!trimmedName) {
-      Alert.alert('Name required', 'Give your binder a name.');
+      toast.error('Give your binder a name.');
       return;
     }
     const initialPages = Math.max(1, Math.min(50, parseInt(pages, 10) || 1));
@@ -44,7 +46,7 @@ export default function NewBinder() {
       });
       router.replace(`/binder/${binder.id}`);
     } catch (e: any) {
-      Alert.alert('Could not create binder', e.message ?? 'Unknown error');
+      toast.error(e.message ?? 'Could not create binder');
     }
   };
 
@@ -64,7 +66,7 @@ export default function NewBinder() {
           <Eyebrow>New binder</Eyebrow>
           <Text style={{
             fontFamily: theme.fontDisplay,
-            fontSize: 30, color: theme.text, marginTop: 4,
+            fontSize: 30, color: theme.text, marginTop: 4, lineHeight: 40,
           }}>Set it up</Text>
 
           {/* name */}

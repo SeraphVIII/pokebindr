@@ -6,7 +6,10 @@
 
 import type { TcgCard } from './types';
 
-const BASE = 'https://api.tcgdex.net/v2/en';
+export type Locale = 'en' | 'ja';
+const ROOT = 'https://api.tcgdex.net/v2';
+const baseFor = (locale: Locale) => `${ROOT}/${locale}`;
+const BASE = baseFor('en'); // legacy default for callers that haven't migrated
 
 // What the /cards list endpoint returns: just enough to render a search row.
 // Set name + price come from a separate /cards/{id} fetch.
@@ -49,6 +52,12 @@ export interface TcgdexSet {
   logo?: string;
   symbol?: string;
   cardCount?: { official: number; total: number };
+  /** ISO date string from TCGdex, e.g. "2024-11-08". Used to sort card
+   *  search results newest-first since TCGdex's own sort param is silently
+   *  ignored on the /cards endpoint. */
+  releaseDate?: string;
+  /** Locale this set was fetched under. Added client-side; not from TCGdex. */
+  locale?: Locale;
 }
 
 function imageUrls(base: string | undefined) {
@@ -105,14 +114,53 @@ function toTcgCard(c: TcgdexCardFull): TcgCard {
   };
 }
 
-/** Search by name. TCGdex matches case-insensitively as substring. */
-export async function searchCards(query: string, page = 1): Promise<TcgdexBrief[]> {
+/** Number of items per page in card search. Exported so the infinite-query
+ *  hook can detect "this was the last page" (page length < ITEMS_PER_PAGE). */
+export const SEARCH_ITEMS_PER_PAGE = 60;
+
+/** Search by name and/or collector-number / set. TCGdex matches both name and
+ *  localId case-insensitively as substring — so "194" also matches 1940, etc.
+ *  That's coarser than exact match but TCGdex's `eq:` operator doesn't behave
+ *  the way the docs suggest on this endpoint, so substring is what we ship. */
+export async function searchCards(
+  query: string,
+  opts: { localId?: string; setId?: string; page?: number } = {},
+): Promise<TcgdexBrief[]> {
   const term = query.trim();
-  if (!term) return [];
-  const url = `${BASE}/cards?name=${encodeURIComponent(term)}&pagination:page=${page}&pagination:itemsPerPage=24`;
+  const { localId, setId, page = 1 } = opts;
+  if (!term && !localId && !setId) return [];
+  const params = new URLSearchParams();
+  if (term) params.set('name', term);
+  if (localId) params.set('localId', localId);
+  if (setId) params.set('set.id', setId);
+  params.set('pagination:page', String(page));
+  params.set('pagination:itemsPerPage', String(SEARCH_ITEMS_PER_PAGE));
+  const url = `${BASE}/cards?${params.toString()}`;
   const r = await fetch(url);
   if (!r.ok) throw new Error(`TCGdex search failed: ${r.status}`);
   return (await r.json()) as TcgdexBrief[];
+}
+
+/** Parse a user-typed search box into structured filters. Detects a trailing
+ *  collector-number-like token (e.g. "194", "194/203", "GG56", "TG06") and
+ *  treats the remainder as a name. A pure-number query goes through as
+ *  `{ localId }` only — useful for "show me every #25 across sets". */
+export function parseSearchQuery(q: string): {
+  name: string;
+  localId?: string;
+} {
+  const trimmed = q.trim();
+  if (!trimmed) return { name: '' };
+  const NUM_RE = /^[a-zA-Z]{0,5}\d+(\/\d+)?$/;
+  const tokens = trimmed.split(/\s+/);
+  const last = tokens[tokens.length - 1];
+  if (NUM_RE.test(last)) {
+    // Drop the "/total" tail if present — TCGdex's localId is the numerator.
+    const localId = last.split('/')[0];
+    const name = tokens.slice(0, -1).join(' ');
+    return { name, localId };
+  }
+  return { name: trimmed };
 }
 
 /** Fetch a single card by id, with full pricing.
@@ -121,9 +169,9 @@ export async function searchCards(query: string, page = 1): Promise<TcgdexBrief[
  * e.g. "me02.5-22") and TCGdex (zero-padded, e.g. "me02.5-022"). Cards
  * added to the user's collection under the old data source kept their
  * unpadded id; we retry with common padding widths when the raw id 404s. */
-export async function getCard(cardId: string): Promise<TcgCard> {
+export async function getCard(cardId: string, locale: Locale = 'en'): Promise<TcgCard> {
   const tryFetch = async (id: string): Promise<TcgdexCardFull | null> => {
-    const r = await fetch(`${BASE}/cards/${id}`);
+    const r = await fetch(`${baseFor(locale)}/cards/${id}`);
     if (r.status === 404) return null;
     if (!r.ok) throw new Error(`TCGdex getCard failed: ${r.status}`);
     return (await r.json()) as TcgdexCardFull;
@@ -153,8 +201,28 @@ export async function getCard(cardId: string): Promise<TcgCard> {
 
 /** Fetch every set so the lookup screen can resolve set name from the
  * prefix of a card id without an extra round-trip per result. */
-export async function getSets(): Promise<TcgdexSet[]> {
-  const r = await fetch(`${BASE}/sets`);
+export async function getSets(locale: Locale = 'en'): Promise<TcgdexSet[]> {
+  const r = await fetch(`${baseFor(locale)}/sets`);
   if (!r.ok) throw new Error(`TCGdex getSets failed: ${r.status}`);
   return (await r.json()) as TcgdexSet[];
+}
+
+export interface TcgdexSetDetail extends TcgdexSet {
+  releaseDate?: string;
+  serie?: { id: string; name: string };
+  cards: Array<{
+    id: string;
+    localId: string;
+    name: string;
+    image?: string;
+    rarity?: string;
+  }>;
+}
+
+/** Fetch a single set including the full card list. Used by the Sets tab
+ * to render a grid + rarity filter for a chosen set. */
+export async function getSet(setId: string, locale: Locale = 'en'): Promise<TcgdexSetDetail> {
+  const r = await fetch(`${baseFor(locale)}/sets/${setId}`);
+  if (!r.ok) throw new Error(`TCGdex getSet failed: ${r.status}`);
+  return (await r.json()) as TcgdexSetDetail;
 }

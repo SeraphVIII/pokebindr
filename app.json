@@ -1,28 +1,47 @@
 {
   "expo": {
-    "name": "Pokémon Tracker",
+    "name": "PokeBindr",
     "slug": "poketracker",
     "version": "0.1.0",
     "orientation": "portrait",
-    "scheme": "pokemontracker",
+    "scheme": "pokebindr",
     "userInterfaceStyle": "dark",
     "newArchEnabled": true,
+    "icon": "./assets/icon.png",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.yourname.pokemontracker"
+      "bundleIdentifier": "com.achilyss.pokebindr"
     },
     "android": {
-      "package": "com.yourname.pokemontracker",
+      "package": "com.achilyss.pokebindr",
       "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#0c0a08"
       }
     },
     "web": {
-      "bundler": "metro"
+      "bundler": "metro",
+      "favicon": "./assets/favicon.png"
     },
     "plugins": [
       "expo-router",
-      "expo-font"
+      "expo-font",
+      "expo-web-browser",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow $(PRODUCT_NAME) to use the camera to scan and identify your cards."
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#0c0a08"
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": false

@@ -1,5 +1,5 @@
-// Tab navigator. Five tabs — Home / Binder / Add / Hunt / You.
-// "Add" is a floating central button visually; here it's a regular tab.
+// Tab navigator. Six tabs — Home / Binder / Sets / Add / Hunt / You.
+// "Add" is the central + button; "Sets" is the TCGdex set browser.
 
 import { Tabs } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
@@ -8,6 +8,7 @@ import { theme } from '@/lib/theme';
 export default function TabsLayout() {
   return (
     <Tabs
+      backBehavior="history"
       screenOptions={{
         headerShown: false,
         sceneStyle: { backgroundColor: theme.bg },
@@ -16,15 +17,16 @@ export default function TabsLayout() {
           borderTopColor: theme.border,
           borderTopWidth: 1,
           height: 64,
-          paddingTop: 8,
-          paddingBottom: 8,
+          paddingTop: 6,
+          paddingBottom: 12,
         },
         tabBarActiveTintColor: theme.accent,
         tabBarInactiveTintColor: theme.textDim,
         tabBarLabelStyle: {
-          fontSize: 10,
+          fontSize: 9,
           fontWeight: '600',
-          letterSpacing: 0.4,
+          letterSpacing: 0.6,
+          textTransform: 'uppercase',
         },
       }}
     >
@@ -43,10 +45,17 @@ export default function TabsLayout() {
         }}
       />
       <Tabs.Screen
+        name="sets"
+        options={{
+          title: 'Sets',
+          tabBarIcon: ({ color, size }) => <Feather name="book-open" size={size} color={color} />,
+        }}
+      />
+      <Tabs.Screen
         name="lookup"
         options={{
-          title: 'Add',
-          tabBarIcon: ({ color, size }) => <Feather name="plus-circle" size={size + 6} color={theme.accent} />,
+          title: 'Search',
+          tabBarIcon: ({ color, size }) => <Feather name="search" size={size} color={color} />,
         }}
       />
       <Tabs.Screen

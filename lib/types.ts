@@ -2,12 +2,25 @@
 
 export type Status = 'have' | 'want' | 'really';
 
+export type Visibility = 'private' | 'unlisted' | 'public';
+
 export interface Binder {
   id: string;
   user_id: string;
   name: string;
   grid_cols: number;
   grid_rows: number;
+  visibility: Visibility;
+  share_token: string | null;
+  likes_count: number;
+  is_bulk: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Profile {
+  user_id: string;
+  username: string | null;
   created_at: string;
   updated_at: string;
 }

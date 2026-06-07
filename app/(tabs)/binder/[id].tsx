@@ -10,34 +10,46 @@
 
 import { useState, useMemo, useRef, useEffect } from 'react';
 import {
-  View, Text, Dimensions, Pressable, ActivityIndicator, Alert,
+  View, Text, Dimensions, Pressable, ActivityIndicator,
   Modal, TextInput, KeyboardAvoidingView, Platform, Image, ScrollView,
 } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Feather } from '@expo/vector-icons';
 import { Gesture, GestureDetector, Directions, GestureHandlerRootView } from 'react-native-gesture-handler';
-import Animated, { useSharedValue, useAnimatedStyle, withTiming, runOnJS } from 'react-native-reanimated';
+import Animated, {
+  useSharedValue, useAnimatedStyle, withTiming, runOnJS,
+  useAnimatedRef, useAnimatedScrollHandler, useFrameCallback, scrollTo,
+} from 'react-native-reanimated';
 import * as Haptics from 'expo-haptics';
 import { Screen } from '@/components/Screen';
 import { Eyebrow } from '@/components/Eyebrow';
+import { clampToContent } from '@/lib/layout';
 import { Chip } from '@/components/Chip';
 import { CardSlot, EmptySlot } from '@/components/CardSlot';
 import {
   useBinder,
   useBinderPages,
   useCollectionByBinder,
+  useEnsureBinderPages,
   useSetStatus,
   useAddPage,
   useUpdatePageTitle,
-  useDeleteBinder,
   useReorderCards,
   useRemoveCard,
   useRemoveCards,
   useDeletePage,
   useSwapPages,
   useReorderPage,
+  useSetBinderVisibility,
+  useMyProfile,
+  useBinders,
+  useMoveCards,
 } from '@/lib/queries';
+import { useToast } from '@/components/Toast';
+import { useConfirm } from '@/components/ConfirmDialog';
+import { SheetCard } from '@/components/SheetCard';
+import * as Clipboard from 'expo-clipboard';
 import { theme } from '@/lib/theme';
 import type { Status, CollectionRow, BinderPage, Binder } from '@/lib/types';
 
@@ -61,11 +73,17 @@ export default function BinderView() {
   const removeCards = useRemoveCards();
   const addPage = useAddPage();
   const updatePageTitle = useUpdatePageTitle();
-  const deleteBinder = useDeleteBinder();
   const reorder = useReorderCards();
   const deletePage = useDeletePage();
   const swapPages = useSwapPages();
   const reorderPage = useReorderPage();
+  const setVisibility = useSetBinderVisibility();
+  const { data: myProfile } = useMyProfile();
+  const { data: allBinders = [] } = useBinders();
+  const moveCards = useMoveCards();
+  const ensurePages = useEnsureBinderPages();
+  const toast = useToast();
+  const confirm = useConfirm();
   const [filter, setFilter] = useState<Filter>('all');
   const [pageIdx, setPageIdx] = useState(() => {
     const p = pageParam ? parseInt(pageParam, 10) : 0;
@@ -84,6 +102,15 @@ export default function BinderView() {
   // instead of opening the action sheet, and drag is disabled.
   const [selecting, setSelecting] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const [shareOpen, setShareOpen] = useState(false);
+  // When non-empty, the move-target picker is shown for these row ids.
+  const [moveRowIds, setMoveRowIds] = useState<string[]>([]);
+  // Default to list view for the bulk binder — its rows have no meaningful
+  // slot positions, so a 3×3 grid layout would just look broken.
+  const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
+  useEffect(() => {
+    if (binder?.is_bulk) setViewMode('list');
+  }, [binder?.is_bulk]);
 
   // Drag state — separated into refs (for stale-closure-free reads inside
   // gesture callbacks) and React state (for re-render triggers).
@@ -155,6 +182,26 @@ export default function BinderView() {
   );
   const current = Math.min(pageIdx, pageCount - 1);
 
+  // Self-heal: if `rows`'s max position implies more pages than `binder_pages`
+  // has rows for, backfill the missing rows. This catches binders mutated by
+  // older app versions (or any past bug) that left positions sparse without
+  // creating the matching page rows — symptom is a greyed "Page menu" pill
+  // and a phantom page that's visible in the grid but absent from the menu.
+  // Uses ALL rows (not the filter) so the heal isn't gated by chip state.
+  const totalMaxPos = useMemo(
+    () => rows.reduce((m, r) => Math.max(m, r.position), -1),
+    [rows],
+  );
+  const pagesNeededTotal = Math.max(1, Math.ceil((totalMaxPos + 1) / slotsPerPage));
+  const ensureMutate = ensurePages.mutate;
+  const ensureIsPending = ensurePages.isPending;
+  useEffect(() => {
+    if (!binder || rows.length === 0) return;
+    if (pagesNeededTotal > pages.length && !ensureIsPending) {
+      ensureMutate(binder.id);
+    }
+  }, [binder, rows.length, pagesNeededTotal, pages.length, ensureIsPending, ensureMutate]);
+
   // Lookup map: absolute position → card. Used to render slots and to
   // detect what (if anything) lives at the drop target.
   const cardByPos = useMemo(() => {
@@ -193,8 +240,9 @@ export default function BinderView() {
   hoverLocalIdxRef.current = hoverLocalIdx;
 
   // Layout numbers (need them before the gesture is built so callbacks can
-  // close over them).
-  const winW = Dimensions.get('window').width;
+  // close over them). Clamped to theme.maxContentW so cards stay phone-sized
+  // on wide desktop browsers.
+  const winW = clampToContent(Dimensions.get('window').width);
   const railPad = 20;
   const gap = 8;
   const innerW = winW - railPad * 2 - 12 - 6;
@@ -284,11 +332,15 @@ export default function BinderView() {
       autoScrollTimerRef.current = null;
     }
   };
-  const startAutoScroll = (dir: 1 | -1, maxY: number) => {
+  // Auto-scroll step is a ref so a running interval picks up the latest
+  // edge-zone depth without being restarted every onUpdate tick.
+  const autoScrollStepRef = useRef(18);
+  const startAutoScroll = (dir: 1 | -1, maxY: number, step = 18) => {
+    autoScrollStepRef.current = step;
     if (autoScrollTimerRef.current) return;
     autoScrollTimerRef.current = setInterval(() => {
       const cur = overlayScrollY.value;
-      const next = Math.max(0, Math.min(maxY, cur + dir * 18));
+      const next = Math.max(0, Math.min(maxY, cur + dir * autoScrollStepRef.current));
       if (next === cur) return;
       overlayScrollY.value = next;
       // Scrolling moves blobs under the finger — clear the pending nav.
@@ -358,7 +410,7 @@ export default function BinderView() {
       { binderId: b.id, updates },
       {
         onError: (e: any) => {
-          Alert.alert('Reorder failed', e?.message ?? String(e));
+          toast.error(e?.message ?? 'Reorder failed');
         },
       },
     );
@@ -419,9 +471,11 @@ export default function BinderView() {
           const totalContentH = rowCount * liveBlobH + Math.max(0, rowCount - 1) * OVERLAY_BLOB_GAP;
           const viewportH = Math.max(0, gestureRootHRef.current - OVERLAY_TOP_PAD - 12);
           const maxScroll = Math.max(0, totalContentH - viewportH);
-          // Thin 70 px band at the very top/bottom edges of the overlay.
+          // Generous band at the very top/bottom edges of the overlay.
           // canScrollUp/Down keep the zones out of the way at the limits.
-          const AUTOSCROLL_ZONE = 70;
+          // 120 px gives a clear, easy-to-hit target without eating most of
+          // the overlay; was 70 px which was hard to find blind during a drag.
+          const AUTOSCROLL_ZONE = 120;
           const cur = overlayScrollY.value;
           const canScrollDown = cur < maxScroll - 0.5;
           const canScrollUp = cur > 0.5;
@@ -431,7 +485,12 @@ export default function BinderView() {
           if (inTopZone || inBottomZone) {
             // Auto-scroll takes priority over navigation. While the finger
             // is parked in the edge band, we just scroll — no blob nav fires.
-            startAutoScroll(inBottomZone ? 1 : -1, maxScroll);
+            // Speed scales with how deep into the edge band the finger is, so
+            // the user can ease in/out instead of all-or-nothing.
+            const depth = inBottomZone
+              ? Math.min(1, (e.y - (gestureRootHRef.current - AUTOSCROLL_ZONE)) / AUTOSCROLL_ZONE)
+              : Math.min(1, ((OVERLAY_TOP_PAD + AUTOSCROLL_ZONE) - e.y) / AUTOSCROLL_ZONE);
+            startAutoScroll(inBottomZone ? 1 : -1, maxScroll, 14 + Math.max(0, depth) * 24);
             cancelBlobHover();
             return;
           }
@@ -561,6 +620,13 @@ export default function BinderView() {
   const currentPage = pages[current];
   const start = current * slotsPerPage;
 
+  // Sum of last known prices for cards on the current page.
+  let pagePriceEur = 0;
+  for (let i = 0; i < slotsPerPage; i++) {
+    const row = cardByPos.get(start + i);
+    if (row?.last_price_eur != null) pagePriceEur += row.last_price_eur;
+  }
+
   const draggedRow = draggedAbsIdx !== null ? cardByPos.get(draggedAbsIdx) ?? null : null;
 
   // ─── handlers ────────────────────────────────────────────────────────
@@ -583,25 +649,43 @@ export default function BinderView() {
     setRenameTargetPage(null);
   };
   const onAddPage = () => {
-    addPage.mutate({ binderId: binder.id });
-    jumpToPage(pageCount);
+    // Insert directly after the page the user is viewing rather than at the
+    // tail. The new page lands at index `current + 1`; reorder_binder_page
+    // shifts everything from `current + 1` onward down by one (including
+    // card positions), so the new page is the one we should jump to.
+    addPage.mutate({ binderId: binder.id, afterIndex: current });
+    jumpToPage(current + 1);
   };
-  const onDeleteBinder = () => {
-    Alert.alert(
-      `Delete "${binder.name}"?`,
-      'All cards in this binder will be removed.',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Delete',
-          style: 'destructive',
-          onPress: async () => {
-            await deleteBinder.mutateAsync(binder.id);
-            router.back();
-          },
-        },
-      ],
+  // Delete-current-page is shared between the header trash icon and the
+  // page-browser action sheet. Same safety checks apply in both places:
+  // last page is undeletable, non-empty pages refuse to delete.
+  const onDeletePage = async (page: BinderPage) => {
+    if (pageCount <= 1) {
+      toast.error('A binder needs at least one page.');
+      return;
+    }
+    const pStart = page.page_index * slotsPerPage;
+    const hasCards = Array.from({ length: slotsPerPage }).some(
+      (_, i) => cardByPos.has(pStart + i),
     );
+    if (hasCards) {
+      toast.error('Remove all cards from this page first.');
+      return;
+    }
+    const ok = await confirm({
+      title: 'Delete page?',
+      message: page.title || 'Untitled page',
+      confirmText: 'Delete',
+      destructive: true,
+    });
+    if (!ok) return;
+    await deletePage.mutateAsync({ pageId: page.id, binderId: binder.id });
+    if (page.page_index === current) {
+      jumpToPage(Math.max(0, current - 1));
+    }
+  };
+  const onDeleteCurrentPage = () => {
+    if (currentPage) onDeletePage(currentPage);
   };
 
   return (
@@ -609,7 +693,7 @@ export default function BinderView() {
       {selecting ? (
         <View style={{
           flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-          paddingHorizontal: 14, paddingTop: 6, paddingBottom: 2,
+          paddingHorizontal: 14, paddingTop: 6, paddingBottom: 2, gap: 8,
         }}>
           <Pressable onPress={() => { setSelecting(false); setSelected(new Set()); }} hitSlop={12}>
             <Text style={{
@@ -621,26 +705,53 @@ export default function BinderView() {
             color: theme.text, fontFamily: theme.fontMono, fontSize: 12,
             letterSpacing: 1.5, textTransform: 'uppercase',
           }}>{selected.size} selected</Text>
+          <View style={{ flexDirection: 'row', gap: 14 }}>
+          {(() => {
+            const allSelected = filtered.length > 0 && filtered.every((r) => selected.has(r.id));
+            return (
+              <Pressable
+                onPress={() => {
+                  if (allSelected) setSelected(new Set());
+                  else setSelected(new Set(filtered.map((r) => r.id)));
+                }}
+                disabled={filtered.length === 0}
+                hitSlop={12}>
+                <Text style={{
+                  color: filtered.length === 0 ? theme.textMute : theme.accent,
+                  fontFamily: theme.fontUIBold,
+                  fontSize: 13, letterSpacing: 0.5, textTransform: 'uppercase',
+                }}>{allSelected ? 'None' : 'All'}</Text>
+              </Pressable>
+            );
+          })()}
           <Pressable
             onPress={() => {
               if (selected.size === 0) return;
+              setMoveRowIds(Array.from(selected));
+            }}
+            disabled={selected.size === 0}
+            hitSlop={12}
+          >
+            <Text style={{
+              color: selected.size === 0 ? theme.textMute : theme.accent,
+              fontFamily: theme.fontUIBold,
+              fontSize: 13, letterSpacing: 0.5, textTransform: 'uppercase',
+            }}>Move</Text>
+          </Pressable>
+          <Pressable
+            onPress={async () => {
+              if (selected.size === 0) return;
               const ids = Array.from(selected);
-              Alert.alert(
-                `Remove ${ids.length} ${ids.length === 1 ? 'card' : 'cards'}?`,
-                'This deletes the selected cards from this binder.',
-                [
-                  { text: 'Cancel', style: 'cancel' },
-                  {
-                    text: 'Remove',
-                    style: 'destructive',
-                    onPress: async () => {
-                      await removeCards.mutateAsync(ids);
-                      setSelected(new Set());
-                      setSelecting(false);
-                    },
-                  },
-                ],
-              );
+              const ok = await confirm({
+                title: `Remove ${ids.length} ${ids.length === 1 ? 'card' : 'cards'}?`,
+                message: 'This deletes the selected cards from this binder.',
+                confirmText: 'Remove',
+                destructive: true,
+              });
+              if (!ok) return;
+              await removeCards.mutateAsync(ids);
+              setSelected(new Set());
+              setSelecting(false);
             }}
             disabled={selected.size === 0}
             hitSlop={12}
@@ -651,20 +762,38 @@ export default function BinderView() {
               fontSize: 13, letterSpacing: 0.5, textTransform: 'uppercase',
             }}>Delete</Text>
           </Pressable>
+          </View>
         </View>
       ) : (
         <View style={{
           flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
           paddingHorizontal: 14, paddingTop: 6, paddingBottom: 2,
         }}>
-          <Pressable onPress={() => router.back()} hitSlop={12}>
+          <Pressable
+            onPress={() => router.navigate('/binder')}
+            hitSlop={12}
+            accessibilityLabel="Back to all binders">
             <Feather name="arrow-left" size={22} color={theme.textDim} />
           </Pressable>
           <View style={{ flexDirection: 'row', gap: 18 }}>
+            <Pressable onPress={() => setViewMode((m) => (m === 'grid' ? 'list' : 'grid'))} hitSlop={12}>
+              <Feather name={viewMode === 'grid' ? 'list' : 'grid'} size={18} color={theme.textDim} />
+            </Pressable>
+            <Pressable onPress={() => setShareOpen(true)} hitSlop={12}>
+              <Feather
+                name={binder?.visibility === 'public' ? 'globe' : binder?.visibility === 'unlisted' ? 'link' : 'lock'}
+                size={18}
+                color={binder?.visibility !== 'private' ? theme.accent : theme.textDim}
+              />
+            </Pressable>
             <Pressable onPress={() => setSelecting(true)} hitSlop={12}>
               <Feather name="check-square" size={18} color={theme.textDim} />
             </Pressable>
-            <Pressable onPress={onDeleteBinder} hitSlop={12}>
+            <Pressable
+              onPress={onDeleteCurrentPage}
+              hitSlop={12}
+              accessibilityLabel="Delete this page"
+            >
               <Feather name="trash-2" size={18} color={theme.textDim} />
             </Pressable>
           </View>
@@ -675,7 +804,7 @@ export default function BinderView() {
         <Eyebrow>{cols}×{rowsN} · {rows.length} {rows.length === 1 ? 'card' : 'cards'}</Eyebrow>
         <Text style={{
           fontFamily: theme.fontDisplay,
-          fontSize: 26, color: theme.text, marginTop: 4,
+          fontSize: 26, color: theme.text, marginTop: 4, lineHeight: 34,
         }}>{binder.name}</Text>
       </View>
 
@@ -683,30 +812,50 @@ export default function BinderView() {
         flexDirection: 'row', flexWrap: 'wrap', gap: 6,
         paddingHorizontal: 24, paddingVertical: 10,
       }}>
-        <Chip label="All"    active={filter === 'all'}    onPress={() => { setFilter('all'); jumpToPage(0); }} />
-        <Chip label="Have"   active={filter === 'have'}   color={theme.statusHave}   onPress={() => { setFilter('have'); jumpToPage(0); }} />
-        <Chip label="Want"   active={filter === 'want'}   color={theme.statusWant}   onPress={() => { setFilter('want'); jumpToPage(0); }} />
-        <Chip label="Need" active={filter === 'really'} color={theme.statusReally} onPress={() => { setFilter('really'); jumpToPage(0); }} />
+        {/* Filter chips no longer jump to page 0 — the page count derives
+            from the highest filtered position, so pageIdx clamps itself if
+            the new filter has fewer pages than the current page. Letting the
+            user stay on their current page is less surprising. */}
+        <Chip label="All"    active={filter === 'all'}    onPress={() => setFilter('all')} />
+        <Chip label="Have"   active={filter === 'have'}   color={theme.statusHave}   onPress={() => setFilter('have')} />
+        <Chip label="Want"   active={filter === 'want'}   color={theme.statusWant}   onPress={() => setFilter('want')} />
+        <Chip label="Need" active={filter === 'really'} color={theme.statusReally} onPress={() => setFilter('really')} />
       </View>
 
-      {/* Reserve a fixed slot for the page title so titled vs untitled pages
-          don't shift the grid vertically. */}
-      <View style={{ paddingHorizontal: 24, paddingBottom: 6, height: 28, justifyContent: 'center' }}>
+      {viewMode === 'grid' ? <>
+      {/* Reserve a fixed slot for the page title + total so titled vs
+          untitled pages don't shift the grid vertically. Height needs to
+          accommodate Cormorant's descenders (g/y/p) at 22pt + a few px of
+          breathing room — 32 used to clip the bottoms. */}
+      <View style={{
+        paddingHorizontal: 24, paddingBottom: 6, height: 40,
+        flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12,
+      }}>
         <Pressable
           onPress={() => openRenameModal()}
           disabled={!currentPage}
           hitSlop={4}
+          style={{ flexShrink: 1 }}
         >
           <Text
             numberOfLines={1}
             style={{
               fontFamily: theme.fontDisplay,
-              fontSize: 16,
+              fontSize: 22,
+              lineHeight: 30,
               color: currentPage?.title ? theme.accent : theme.textDim,
             }}>
             {currentPage?.title ?? '+ Page title'}
           </Text>
         </Pressable>
+        {pagePriceEur > 0 && (
+          <Text style={{
+            color: theme.textDim, fontFamily: theme.fontMono,
+            fontSize: 13, letterSpacing: 0.3,
+          }}>
+            €{pagePriceEur.toFixed(2)}
+          </Text>
+        )}
       </View>
 
       <GestureDetector gesture={outerGesture}>
@@ -890,6 +1039,8 @@ export default function BinderView() {
       {dragOverlayOpen && (() => {
         const rowCount = Math.ceil(pageCount / 2);
         const totalContentH = rowCount * overlayBlobH + Math.max(0, rowCount - 1) * OVERLAY_BLOB_GAP;
+        const viewportH = Math.max(0, gestureRootH - OVERLAY_TOP_PAD - 12);
+        const canScrollMore = totalContentH > viewportH;
         return (
           <View
             pointerEvents="none"
@@ -903,8 +1054,27 @@ export default function BinderView() {
               color: theme.textDim, fontFamily: theme.fontMono, fontSize: 11,
               letterSpacing: 1.5, textTransform: 'uppercase', textAlign: 'center',
             }}>
-              Hover a page to jump
+              Hover a page to jump{canScrollMore ? ' · drag to edges to scroll' : ''}
             </Text>
+
+            {/* Edge affordances — only visible when content overflows, so they
+                advertise the auto-scroll bands without cluttering small lists. */}
+            {canScrollMore && (
+              <>
+                <View style={{
+                  position: 'absolute', top: OVERLAY_TOP_PAD,
+                  left: 0, right: 0, alignItems: 'center',
+                }}>
+                  <Feather name="chevron-up" size={18} color={theme.textDim} />
+                </View>
+                <View style={{
+                  position: 'absolute', bottom: 12,
+                  left: 0, right: 0, alignItems: 'center',
+                }}>
+                  <Feather name="chevron-down" size={18} color={theme.textDim} />
+                </View>
+              </>
+            )}
 
 
             <View
@@ -993,6 +1163,30 @@ export default function BinderView() {
 
       </View>
       </GestureDetector>
+      </> : (
+        <BinderListCards
+          rows={rows}
+          selecting={selecting}
+          selected={selected}
+          onTap={(r) => {
+            if (selecting) {
+              setSelected((prev) => {
+                const next = new Set(prev);
+                if (next.has(r.id)) next.delete(r.id); else next.add(r.id);
+                return next;
+              });
+            } else {
+              router.push(`/card/${r.card_id}?row=${r.id}`);
+            }
+          }}
+          onLongPress={(r) => {
+            if (!selecting) {
+              setSelecting(true);
+              setSelected(new Set([r.id]));
+            }
+          }}
+        />
+      )}
 
       <PageBrowserModal
         open={pageMenuOpen}
@@ -1005,15 +1199,42 @@ export default function BinderView() {
         slotsPerPage={slotsPerPage}
         onSelectPage={(idx) => { jumpToPage(idx); setPageMenuOpen(false); }}
         onReorderPage={async (page, toIdx) => {
+          const src = page.page_index;
+          // Adjacent-forward (drag n onto n+1) is the one case where
+          // "insert in front of target" collapses to a no-op (newIndex
+          // would equal src). Special-case it to a swap so the gesture
+          // produces the obvious result: the two pages exchange. Adjacent-
+          // backward (n+1 onto n) already swaps as a natural side effect
+          // of the splice insertion.
+          if (src + 1 === toIdx) {
+            const newCurr =
+              current === src ? toIdx :
+              current === toIdx ? src :
+              current;
+            await swapPages.mutateAsync({
+              binderId: binder.id,
+              idxA: src,
+              idxB: toIdx,
+            });
+            if (newCurr !== current) jumpToPage(newCurr);
+            return;
+          }
+          // "Insert in front of target" semantics: dropping on slot N
+          // means the dragged page lands IMMEDIATELY BEFORE the page that
+          // was at N. The SQL reorder_binder_page is splice-insertion, so
+          // for a downward drag (src < toIdx) the dragged page lands at the
+          // newIndex we pass; passing toIdx-1 makes it stop one slot
+          // earlier — right in front of the target.
+          const newIndex = src < toIdx ? toIdx - 1 : toIdx;
+          if (newIndex === src) return;
           // Predict where the previously-viewed page lands so the binder
           // keeps following the user's actual content (not a fixed index).
-          const src = page.page_index;
           let newCurr = current;
-          if (current === src) newCurr = toIdx;
-          else if (src < toIdx && current > src && current <= toIdx) newCurr = current - 1;
-          else if (src > toIdx && current >= toIdx && current < src) newCurr = current + 1;
+          if (current === src) newCurr = newIndex;
+          else if (src < newIndex && current > src && current <= newIndex) newCurr = current - 1;
+          else if (src > newIndex && current >= newIndex && current < src) newCurr = current + 1;
           await reorderPage.mutateAsync({
-            binderId: binder.id, pageId: page.id, newIndex: toIdx,
+            binderId: binder.id, pageId: page.id, newIndex,
           });
           if (newCurr !== current) jumpToPage(newCurr);
         }}
@@ -1034,38 +1255,7 @@ export default function BinderView() {
           setPageMenuOpen(false);
           openRenameModal(page);
         }}
-        onDeletePage={(page) => {
-          if (pageCount <= 1) {
-            Alert.alert('Cannot delete', 'A binder needs at least one page.');
-            return;
-          }
-          const pStart = page.page_index * slotsPerPage;
-          const hasCards = Array.from({ length: slotsPerPage }).some(
-            (_, i) => cardByPos.has(pStart + i),
-          );
-          if (hasCards) {
-            Alert.alert('Page not empty', 'Remove all cards from this page first.');
-            return;
-          }
-          Alert.alert(
-            'Delete page?',
-            page.title || 'Untitled page',
-            [
-              { text: 'Cancel', style: 'cancel' },
-              {
-                text: 'Delete',
-                style: 'destructive',
-                onPress: async () => {
-                  await deletePage.mutateAsync({ pageId: page.id, binderId: binder.id });
-                  // If we deleted the page the user is viewing, step back one.
-                  if (page.page_index === current) {
-                    jumpToPage(Math.max(0, current - 1));
-                  }
-                },
-              },
-            ],
-          );
-        }}
+        onDeletePage={onDeletePage}
         onAddPage={onAddPage}
       />
 
@@ -1077,37 +1267,43 @@ export default function BinderView() {
           router.push(`/card/${row.card_id}?row=${row.id}`);
         }}
         onStatus={(row, s) => setStatus.mutate({ rowId: row.id, status: s })}
-        onDelete={(row) => {
-          Alert.alert('Remove from binder?', row.card_name, [
-            { text: 'Cancel', style: 'cancel' },
-            {
-              text: 'Remove',
-              style: 'destructive',
-              onPress: async () => {
-                setActionRowId(null);
-                await removeCard.mutateAsync(row.id);
-              },
-            },
-          ]);
+        onMove={(row) => {
+          setActionRowId(null);
+          setMoveRowIds([row.id]);
+        }}
+        onDelete={async (row) => {
+          const ok = await confirm({
+            title: 'Remove from binder?',
+            message: row.card_name,
+            confirmText: 'Remove',
+            destructive: true,
+          });
+          if (!ok) return;
+          setActionRowId(null);
+          await removeCard.mutateAsync(row.id);
         }}
       />
 
       <Modal
         visible={titleModalOpen}
         transparent
-        animationType="fade"
+        animationType="none"
         onRequestClose={() => setTitleModalOpen(false)}
       >
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-          style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', padding: 24 }}
+          style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', alignItems: 'center', padding: 24 }}
         >
-          <View style={{
-            backgroundColor: theme.surface,
-            borderWidth: 1, borderColor: theme.borderStrong,
-            borderRadius: theme.radius * 1.5,
-            padding: 20,
-          }}>
+          <SheetCard
+            key={titleModalOpen ? 'open' : 'closed'}
+            style={{
+              width: '100%', maxWidth: theme.maxContentW - 48,
+              backgroundColor: theme.surface,
+              borderWidth: 1, borderColor: theme.borderStrong,
+              borderRadius: theme.radius * 1.5,
+              padding: 20,
+            }}
+          >
             <Eyebrow>Page title</Eyebrow>
             <Text style={{ color: theme.textDim, fontSize: 12, marginTop: 4 }}>
               Optional — leave blank to clear.
@@ -1151,9 +1347,49 @@ export default function BinderView() {
                 </Text>
               </Pressable>
             </View>
-          </View>
+          </SheetCard>
         </KeyboardAvoidingView>
       </Modal>
+
+      <ShareSheet
+        open={shareOpen}
+        binder={binder ?? null}
+        username={myProfile?.username ?? null}
+        onClose={() => setShareOpen(false)}
+        onChangeVisibility={async (v) => {
+          if (!binder) return;
+          try {
+            await setVisibility.mutateAsync({ binderId: binder.id, visibility: v });
+          } catch (e: any) {
+            toast.error(e?.message ?? 'Could not change visibility');
+          }
+        }}
+        onCopy={(label, text) => {
+          Clipboard.setStringAsync(text);
+          toast.success(`${label} copied to clipboard`);
+        }}
+      />
+
+      <MoveTargetSheet
+        rowIds={moveRowIds}
+        binders={allBinders.filter((b) => b.id !== id)}
+        onClose={() => setMoveRowIds([])}
+        onPick={(targetBinderId) => {
+          const ids = moveRowIds;
+          setMoveRowIds([]);
+          moveCards.mutate(
+            { rowIds: ids, targetBinderId },
+            {
+              onSuccess: ({ moved }) => {
+                toast.success(`Moved ${moved} ${moved === 1 ? 'card' : 'cards'}`);
+                setSelecting(false);
+                setSelected(new Set());
+              },
+              onError: (e: any) => toast.error(e?.message ?? 'Could not move'),
+            },
+          );
+        }}
+      />
     </Screen>
   );
 }
@@ -1178,14 +1414,89 @@ function pageMenuLabelStyle(disabled?: boolean) {
   };
 }
 
+function BinderListCards({
+  rows, selecting, selected, onTap, onLongPress,
+}: {
+  rows: CollectionRow[];
+  selecting: boolean;
+  selected: Set<string>;
+  onTap: (row: CollectionRow) => void;
+  onLongPress: (row: CollectionRow) => void;
+}) {
+  return (
+    <ScrollView
+      style={{ flex: 1 }}
+      contentContainerStyle={{ paddingHorizontal: 16, paddingTop: 8, paddingBottom: 32, gap: 6 }}
+    >
+      {rows.length === 0 ? (
+        <Text style={{ color: theme.textDim, textAlign: 'center', padding: 40, fontSize: 13 }}>
+          No cards match this filter.
+        </Text>
+      ) : rows.map((r) => {
+        const isSelected = selected.has(r.id);
+        const statusColor =
+          r.status === 'have' ? theme.statusHave :
+          r.status === 'want' ? theme.statusWant : theme.statusReally;
+        return (
+          <Pressable
+            key={r.id}
+            onPress={() => onTap(r)}
+            onLongPress={() => onLongPress(r)}
+            delayLongPress={280}
+            style={{
+              flexDirection: 'row', alignItems: 'center', gap: 12,
+              padding: 10,
+              backgroundColor: theme.surface,
+              borderWidth: 1,
+              borderColor: isSelected ? theme.accent : theme.border,
+              borderRadius: theme.radius,
+            }}
+          >
+            {selecting && (
+              <Feather
+                name={isSelected ? 'check-square' : 'square'}
+                size={18}
+                color={isSelected ? theme.accent : theme.textMute}
+              />
+            )}
+            {r.image_small ? (
+              <Image
+                source={{ uri: r.image_small }}
+                style={{ width: 40, height: 56, borderRadius: 4, backgroundColor: theme.surface2 }}
+              />
+            ) : (
+              <View style={{ width: 40, height: 56, borderRadius: 4, backgroundColor: theme.surface2 }} />
+            )}
+            <View style={{ flex: 1, minWidth: 0 }}>
+              <Text numberOfLines={1} style={{ color: theme.text, fontSize: 14, fontFamily: theme.fontUI }}>
+                {r.card_name}
+              </Text>
+              <Text numberOfLines={1} style={{ color: theme.textDim, fontSize: 11, fontFamily: theme.fontMono, marginTop: 2 }}>
+                {r.set_name} · {r.card_number}{r.condition && r.condition !== 'NM' ? ` · ${r.condition}` : ''}
+              </Text>
+            </View>
+            <View style={{ alignItems: 'flex-end', gap: 4 }}>
+              <Text style={{ color: theme.text, fontSize: 13, fontFamily: theme.fontMono }}>
+                {r.last_price_eur != null ? `€${r.last_price_eur.toFixed(2)}` : '—'}
+              </Text>
+              <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: statusColor }} />
+            </View>
+          </Pressable>
+        );
+      })}
+    </ScrollView>
+  );
+}
+
 function CardActionSheet({
-  row, onClose, onInfo, onStatus, onDelete,
+  row, onClose, onInfo, onStatus, onDelete, onMove,
 }: {
   row: CollectionRow | null;
   onClose: () => void;
   onInfo: (row: CollectionRow) => void;
   onStatus: (row: CollectionRow, s: Status) => void;
   onDelete: (row: CollectionRow) => void;
+  onMove: (row: CollectionRow) => void;
 }) {
   const insets = useSafeAreaInsets();
   return (
@@ -1197,12 +1508,13 @@ function CardActionSheet({
       navigationBarTranslucent
       onRequestClose={onClose}
     >
-      <View style={{ flex: 1, justifyContent: 'flex-end' }}>
+      <View style={{ flex: 1, justifyContent: 'flex-end', alignItems: 'center' }}>
         <Pressable
           onPress={onClose}
-          style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.6)' }}
+          style={{ flex: 1, alignSelf: 'stretch', backgroundColor: 'rgba(0,0,0,0.6)' }}
         />
         <View style={{
+          width: '100%', maxWidth: theme.maxContentW,
           backgroundColor: theme.surface,
           borderTopLeftRadius: theme.radius * 2,
           borderTopRightRadius: theme.radius * 2,
@@ -1238,6 +1550,17 @@ function CardActionSheet({
           </Pressable>
 
           <Pressable
+            onPress={() => row && onMove(row)}
+            style={{
+              flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+              paddingVertical: 14,
+              borderTopWidth: 1, borderTopColor: theme.border,
+            }}>
+            <Text style={{ color: theme.text, fontSize: 15 }}>Move to binder…</Text>
+            <Feather name="chevron-right" size={16} color={theme.textDim} />
+          </Pressable>
+
+          <Pressable
             onPress={() => row && onDelete(row)}
             style={{
               paddingVertical: 14,
@@ -1248,6 +1571,223 @@ function CardActionSheet({
         </View>
       </View>
     </Modal>
+  );
+}
+
+function MoveTargetSheet({
+  rowIds, binders, onClose, onPick,
+}: {
+  rowIds: string[];
+  binders: Binder[];
+  onClose: () => void;
+  onPick: (binderId: string) => void;
+}) {
+  const insets = useSafeAreaInsets();
+  const open = rowIds.length > 0;
+  return (
+    <Modal
+      visible={open}
+      transparent
+      animationType="slide"
+      statusBarTranslucent
+      navigationBarTranslucent
+      onRequestClose={onClose}
+    >
+      <View style={{ flex: 1, justifyContent: 'flex-end', alignItems: 'center' }}>
+        <Pressable
+          onPress={onClose}
+          style={{ flex: 1, alignSelf: 'stretch', backgroundColor: 'rgba(0,0,0,0.6)' }}
+        />
+        <View style={{
+          width: '100%', maxWidth: theme.maxContentW,
+          maxHeight: '60%',
+          backgroundColor: theme.surface,
+          borderTopLeftRadius: theme.radius * 2,
+          borderTopRightRadius: theme.radius * 2,
+          borderTopWidth: 1, borderLeftWidth: 1, borderRightWidth: 1,
+          borderColor: theme.borderStrong,
+          paddingHorizontal: 20, paddingTop: 18,
+          paddingBottom: 24 + insets.bottom,
+        }}>
+          <Eyebrow>
+            Move {rowIds.length} {rowIds.length === 1 ? 'card' : 'cards'} to
+          </Eyebrow>
+          <Text style={{
+            fontFamily: theme.fontDisplay,
+            fontSize: 20, color: theme.text, marginTop: 4, marginBottom: 12,
+          }}>Choose a binder</Text>
+          <ScrollView>
+            {binders.map((b) => (
+              <Pressable
+                key={b.id}
+                onPress={() => onPick(b.id)}
+                style={{
+                  flexDirection: 'row', alignItems: 'center', gap: 10,
+                  paddingVertical: 14, paddingHorizontal: 4,
+                  borderBottomWidth: 1, borderBottomColor: theme.border,
+                }}>
+                {b.is_bulk && (
+                  <Feather name="package" size={14} color={theme.accent} />
+                )}
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <Text style={{
+                    color: theme.text, fontSize: 15, fontFamily: theme.fontUI,
+                  }}>{b.name}</Text>
+                  <Text style={{
+                    fontFamily: theme.fontMono, fontSize: 11,
+                    color: theme.textDim, marginTop: 2,
+                  }}>
+                    {b.is_bulk ? 'Loose cards' : `${b.grid_cols}×${b.grid_rows}`}
+                  </Text>
+                </View>
+                <Feather name="chevron-right" size={16} color={theme.textMute} />
+              </Pressable>
+            ))}
+            {binders.length === 0 && (
+              <Text style={{ color: theme.textDim, fontSize: 13, paddingVertical: 16 }}>
+                No other binders. Create one to move cards into.
+              </Text>
+            )}
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function ShareSheet({
+  open, binder, username, onClose, onChangeVisibility, onCopy,
+}: {
+  open: boolean;
+  binder: Binder | null;
+  username: string | null;
+  onClose: () => void;
+  onChangeVisibility: (v: 'private' | 'unlisted' | 'public') => void;
+  onCopy: (label: string, text: string) => void;
+}) {
+  const insets = useSafeAreaInsets();
+  if (!binder) return null;
+  const v = binder.visibility ?? 'private';
+  // The mobile app deep-links to /share and /u routes; for the web bundle
+  // we use the same paths off the current origin. Falls back to a plain
+  // path if there's no window (native).
+  const origin =
+    typeof window !== 'undefined' && window.location ? window.location.origin : '';
+  const shareUrl = binder.share_token ? `${origin}/share/${binder.share_token}` : null;
+  const profileUrl = username && v === 'public' ? `${origin}/u/${username}/binder/${binder.id}` : null;
+
+  return (
+    <Modal
+      visible={open}
+      transparent
+      animationType="slide"
+      statusBarTranslucent
+      navigationBarTranslucent
+      onRequestClose={onClose}
+    >
+      <View style={{ flex: 1, justifyContent: 'flex-end', alignItems: 'center' }}>
+        <Pressable
+          onPress={onClose}
+          style={{ flex: 1, alignSelf: 'stretch', backgroundColor: 'rgba(0,0,0,0.6)' }}
+        />
+        <View style={{
+          width: '100%', maxWidth: theme.maxContentW,
+          backgroundColor: theme.surface,
+          borderTopLeftRadius: theme.radius * 2,
+          borderTopRightRadius: theme.radius * 2,
+          borderTopWidth: 1, borderLeftWidth: 1, borderRightWidth: 1,
+          borderColor: theme.borderStrong,
+          paddingHorizontal: 20, paddingTop: 18,
+          paddingBottom: 28 + insets.bottom,
+        }}>
+          <Eyebrow>Share</Eyebrow>
+          <Text style={{
+            fontFamily: theme.fontDisplay,
+            fontSize: 22, color: theme.text, marginTop: 4, marginBottom: 14,
+          }}>{binder.name}</Text>
+
+          <VisibilityRow label="Private"  desc="Only you can see this binder."           active={v === 'private'}  onPress={() => onChangeVisibility('private')}  icon="lock" />
+          <VisibilityRow label="Unlisted" desc="Anyone with the link can view."           active={v === 'unlisted'} onPress={() => onChangeVisibility('unlisted')} icon="link" />
+          <VisibilityRow label="Public"   desc="Listed on your profile, link sharable."   active={v === 'public'}   onPress={() => onChangeVisibility('public')}   icon="globe" />
+
+          {shareUrl && (
+            <Pressable
+              onPress={() => onCopy('Share link', shareUrl)}
+              style={{
+                marginTop: 16, padding: 12,
+                borderWidth: 1, borderColor: theme.border,
+                borderRadius: theme.radius,
+                flexDirection: 'row', alignItems: 'center', gap: 10,
+              }}>
+              <Feather name="copy" size={14} color={theme.accent} />
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <Text style={{ color: theme.textDim, fontSize: 10, fontFamily: theme.fontMono, letterSpacing: 0.8, textTransform: 'uppercase' }}>
+                  Share link
+                </Text>
+                <Text numberOfLines={1} style={{ color: theme.text, fontSize: 12, fontFamily: theme.fontMono, marginTop: 2 }}>
+                  {shareUrl}
+                </Text>
+              </View>
+            </Pressable>
+          )}
+          {profileUrl && (
+            <Pressable
+              onPress={() => onCopy('Profile link', profileUrl)}
+              style={{
+                marginTop: 8, padding: 12,
+                borderWidth: 1, borderColor: theme.border,
+                borderRadius: theme.radius,
+                flexDirection: 'row', alignItems: 'center', gap: 10,
+              }}>
+              <Feather name="user" size={14} color={theme.accent} />
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <Text style={{ color: theme.textDim, fontSize: 10, fontFamily: theme.fontMono, letterSpacing: 0.8, textTransform: 'uppercase' }}>
+                  Profile link
+                </Text>
+                <Text numberOfLines={1} style={{ color: theme.text, fontSize: 12, fontFamily: theme.fontMono, marginTop: 2 }}>
+                  {profileUrl}
+                </Text>
+              </View>
+            </Pressable>
+          )}
+          {v === 'public' && !username && (
+            <Text style={{ color: theme.textDim, fontSize: 11, marginTop: 10 }}>
+              Set a username in your profile to get a /u/&lt;name&gt; link.
+            </Text>
+          )}
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function VisibilityRow({
+  label, desc, active, onPress, icon,
+}: {
+  label: string;
+  desc: string;
+  active: boolean;
+  onPress: () => void;
+  icon: 'lock' | 'link' | 'globe';
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      style={{
+        flexDirection: 'row', alignItems: 'center', gap: 12,
+        paddingVertical: 12, paddingHorizontal: 4,
+        borderTopWidth: 1, borderTopColor: theme.border,
+      }}>
+      <Feather name={icon} size={16} color={active ? theme.accent : theme.textDim} />
+      <View style={{ flex: 1, minWidth: 0 }}>
+        <Text style={{
+          color: active ? theme.accent : theme.text,
+          fontSize: 14, fontFamily: theme.fontUIBold,
+        }}>{label}</Text>
+        <Text style={{ color: theme.textDim, fontSize: 11, marginTop: 2 }}>{desc}</Text>
+      </View>
+      {active && <Feather name="check" size={16} color={theme.accent} />}
+    </Pressable>
   );
 }
 
@@ -1294,7 +1834,7 @@ function PageBrowserModal({
   onMovePage: (page: BinderPage, dir: 'left' | 'right') => void;
 }) {
   const insets = useSafeAreaInsets();
-  const screenW = Dimensions.get('window').width;
+  const screenW = clampToContent(Dimensions.get('window').width);
   const SIDE_PAD = 16;
   const BLOB_GAP = 12;
   const COLS_2 = 2;
@@ -1317,62 +1857,168 @@ function PageBrowserModal({
   const dragY = useSharedValue(0);
   const [actionsPage, setActionsPage] = useState<BinderPage | null>(null);
 
+  // Mirrors of the React state for the UI-thread worklets — gesture callbacks
+  // run on the UI thread now and can't read React state directly, so the
+  // shared values are the source of truth during the drag and the React state
+  // setters are called via runOnJS only when the state actually changes.
+  const dragIdxSV = useSharedValue<number | null>(null);
+  const hoverIdxSV = useSharedValue<number | null>(null);
   const dragIdxRef = useRef<number | null>(null);
   dragIdxRef.current = dragIdx;
   const hoverIdxRef = useRef<number | null>(null);
   hoverIdxRef.current = hoverIdx;
-  const pagesLenRef = useRef(pages.length);
-  pagesLenRef.current = pages.length;
 
-  const blobAt = (x: number, y: number): number | null => {
-    const col = Math.floor(x / (blobW + BLOB_GAP));
-    if (col < 0 || col >= COLS_2) return null;
-    const row = Math.floor(y / (blobH + BLOB_GAP));
-    if (row < 0) return null;
-    const idx = row * COLS_2 + col;
-    if (idx < 0 || idx >= pagesLenRef.current) return null;
-    return idx;
-  };
+  // Auto-scroll while reordering: when the finger sits near the top/bottom
+  // of the scroll viewport during a drag, scroll the page list automatically.
+  //
+  // Implementation note: the earlier version drove this with a JS-thread
+  // setInterval calling ScrollView.scrollTo, which contended with React
+  // re-renders from setHoverIdx and felt visibly laggy. Now everything that
+  // ticks during the drag runs on the UI thread:
+  //   - useAnimatedScrollHandler keeps scrollYSV in sync with the native
+  //     scroll offset (UI thread, no JS bridge).
+  //   - useFrameCallback runs every UI-thread frame and calls the Reanimated
+  //     scrollTo() worklet, which scrolls natively without touching JS.
+  //   - The JS-thread gesture only writes direction + speed shared values.
+  const scrollRef = useAnimatedRef<Animated.ScrollView>();
+  const scrollYSV = useSharedValue(0);
+  const viewportHSV = useSharedValue(0);
+  const contentHSV = useSharedValue(0);
+  const autoScrollDirSV = useSharedValue<-1 | 0 | 1>(0);
+  const autoScrollSpeedSV = useSharedValue(24);
+  useFrameCallback(() => {
+    'worklet';
+    if (autoScrollDirSV.value === 0) return;
+    const maxScroll = Math.max(0, contentHSV.value - viewportHSV.value);
+    const next = Math.max(
+      0,
+      Math.min(maxScroll, scrollYSV.value + autoScrollDirSV.value * autoScrollSpeedSV.value),
+    );
+    if (next === scrollYSV.value) return;
+    scrollTo(scrollRef, 0, next, false);
+    // Update SV ourselves rather than waiting for onScroll to round-trip:
+    // useAnimatedScrollHandler fires after the native scroll event lands,
+    // which can be a frame behind. Without this, the next frame computes
+    // its "next" position against a stale base and visibly stutters.
+    scrollYSV.value = next;
+    // No need to compensate dragY for scroll — the overlay now lives
+    // OUTSIDE the ScrollView and renders at screen-absolute coordinates,
+    // so the scroll doesn't move it.
+  }, true);
+  const animatedScrollHandler = useAnimatedScrollHandler({
+    onScroll: (e) => { scrollYSV.value = e.contentOffset.y; },
+  });
+  const PAGE_AUTOSCROLL_ZONE = 140;
 
-  const panGesture = useMemo(
-    () => Gesture.Pan()
+  const panGesture = useMemo(() => {
+    const pagesLen = pages.length;
+    // JS handlers — invoked via runOnJS from the worklet callbacks. Captured
+    // in the useMemo closure so they always see the latest `pages` and
+    // `onReorderPage`. setDragIdx/setHoverIdx are stable React setters.
+    const onStartJS = (idx: number) => {
+      setDragIdx(idx);
+      setHoverIdx(idx);
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    };
+    const onHoverChangeJS = (idx: number | null) => {
+      setHoverIdx(idx);
+    };
+    const onEndJS = (d: number, h: number | null) => {
+      setDragIdx(null);
+      setHoverIdx(null);
+      if (h !== null && d !== h) {
+        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+        const page = pages[d];
+        if (page) onReorderPage(page, h);
+      }
+    };
+    const onFinalizeJS = () => {
+      setDragIdx(null);
+      setHoverIdx(null);
+    };
+    return Gesture.Pan()
       .activateAfterLongPress(300)
-      .runOnJS(true)
+      // No .runOnJS(true) — callbacks run as worklets on the UI thread so the
+      // drag position and auto-scroll trigger update every frame even when
+      // the JS thread is busy with renders.
       .onStart((e) => {
-        const idx = blobAt(e.x, e.y);
-        if (idx === null) return;
-        setDragIdx(idx);
-        setHoverIdx(idx);
-        dragX.value = e.x;
-        dragY.value = e.y;
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+        'worklet';
+        // Inline blobAt — closures over pagesLen captured above.
+        const col = Math.floor(e.x / (blobW + BLOB_GAP));
+        if (col < 0 || col >= COLS_2) return;
+        const row = Math.floor(e.y / (blobH + BLOB_GAP));
+        if (row < 0) return;
+        const idx = row * COLS_2 + col;
+        if (idx < 0 || idx >= pagesLen) return;
+        dragIdxSV.value = idx;
+        hoverIdxSV.value = idx;
+        // Overlay sits outside the ScrollView and renders at screen
+        // coordinates — absoluteX/Y stay correct as content scrolls.
+        dragX.value = e.absoluteX;
+        dragY.value = e.absoluteY;
+        runOnJS(onStartJS)(idx);
       })
       .onUpdate((e) => {
-        if (dragIdxRef.current === null) return;
-        dragX.value = e.x;
-        dragY.value = e.y;
-        const idx = blobAt(e.x, e.y);
-        if (idx !== hoverIdxRef.current) setHoverIdx(idx);
+        'worklet';
+        if (dragIdxSV.value === null) return;
+        dragX.value = e.absoluteX;
+        dragY.value = e.absoluteY;
+        // Inline blobAt
+        let idx: number | null = null;
+        const col = Math.floor(e.x / (blobW + BLOB_GAP));
+        if (col >= 0 && col < COLS_2) {
+          const row = Math.floor(e.y / (blobH + BLOB_GAP));
+          if (row >= 0) {
+            const i = row * COLS_2 + col;
+            if (i >= 0 && i < pagesLen) idx = i;
+          }
+        }
+        if (idx !== hoverIdxSV.value) {
+          hoverIdxSV.value = idx;
+          runOnJS(onHoverChangeJS)(idx);
+        }
+        const viewportH = viewportHSV.value;
+        const contentH = contentHSV.value;
+        if (viewportH <= 0) {
+          autoScrollDirSV.value = 0;
+          return;
+        }
+        const maxScroll = Math.max(0, contentH - viewportH);
+        const viewportTop = scrollYSV.value;
+        const viewportBottom = viewportTop + viewportH;
+        const canScrollUp = viewportTop > 0.5;
+        const canScrollDown = viewportTop < maxScroll - 0.5;
+        const inTopZone = canScrollUp && e.y < viewportTop + PAGE_AUTOSCROLL_ZONE;
+        const inBottomZone = canScrollDown && e.y > viewportBottom - PAGE_AUTOSCROLL_ZONE;
+        if (inTopZone || inBottomZone) {
+          const depth = inBottomZone
+            ? Math.min(1, (e.y - (viewportBottom - PAGE_AUTOSCROLL_ZONE)) / PAGE_AUTOSCROLL_ZONE)
+            : Math.min(1, ((viewportTop + PAGE_AUTOSCROLL_ZONE) - e.y) / PAGE_AUTOSCROLL_ZONE);
+          autoScrollSpeedSV.value = 6 + Math.max(0, depth) * 12;
+          autoScrollDirSV.value = inBottomZone ? 1 : -1;
+        } else {
+          autoScrollDirSV.value = 0;
+        }
       })
       .onEnd(() => {
-        const d = dragIdxRef.current;
-        const h = hoverIdxRef.current;
-        setDragIdx(null);
-        setHoverIdx(null);
-        if (d !== null && h !== null && d !== h) {
-          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-          const page = pages[d];
-          if (page) onReorderPage(page, h);
-        }
+        'worklet';
+        autoScrollDirSV.value = 0;
+        const d = dragIdxSV.value;
+        const h = hoverIdxSV.value;
+        dragIdxSV.value = null;
+        hoverIdxSV.value = null;
+        if (d !== null) runOnJS(onEndJS)(d, h);
       })
       .onFinalize(() => {
-        if (dragIdxRef.current !== null) {
-          setDragIdx(null);
-          setHoverIdx(null);
+        'worklet';
+        autoScrollDirSV.value = 0;
+        if (dragIdxSV.value !== null) {
+          dragIdxSV.value = null;
+          hoverIdxSV.value = null;
+          runOnJS(onFinalizeJS)();
         }
-      }),
-    [blobW, blobH, BLOB_GAP, pages, onReorderPage],
-  );
+      });
+  }, [blobW, blobH, BLOB_GAP, pages, onReorderPage]);
 
   const overlayStyle = useAnimatedStyle(() => ({
     transform: [
@@ -1416,9 +2062,17 @@ function PageBrowserModal({
             }}>Tap to open · hold &amp; drag to reorder</Text>
           </View>
 
-          <ScrollView
+          <Animated.ScrollView
+            ref={scrollRef}
             contentContainerStyle={{ paddingHorizontal: SIDE_PAD, paddingBottom: 40 + insets.bottom, paddingTop: 6 }}
             scrollEnabled={dragIdx === null}
+            onLayout={(e) => { viewportHSV.value = e.nativeEvent.layout.height; }}
+            onContentSizeChange={(_w, h) => { contentHSV.value = h; }}
+            // scrollEnabled={false} doesn't block Reanimated's scrollTo
+            // worklet, so auto-scroll still works during drag. The animated
+            // scroll handler keeps scrollYSV in sync on the UI thread.
+            onScroll={animatedScrollHandler}
+            scrollEventThrottle={16}
           >
             <GestureDetector gesture={panGesture}>
               <View style={{ width: COLS_2 * blobW + BLOB_GAP, height: totalH, position: 'relative' }}>
@@ -1498,40 +2152,46 @@ function PageBrowserModal({
                     </View>
                   );
                 })()}
-                {dragIdx !== null && pages[dragIdx] && (
-                  <Animated.View
-                    pointerEvents="none"
-                    style={[{
-                      position: 'absolute', left: 0, top: 0,
-                      width: blobW, height: blobH, zIndex: 100, opacity: 0.92,
-                    }, overlayStyle]}
-                  >
-                    <PageBlob
-                      p={dragIdx}
-                      pageTitle={pages[dragIdx]?.title}
-                      blobW={blobW}
-                      blobH={blobH}
-                      innerW={innerW}
-                      cardCols={cardCols}
-                      cardRowsN={cardRowsN}
-                      slotsPerPage={slotsPerPage}
-                      miniCardW={miniCardW}
-                      miniCardH={miniCardH}
-                      miniGridH={miniGridH}
-                      cardG={cardG}
-                      blobPad={BLOB_PAD}
-                      headerH={HEADER_H}
-                      headerGap={HEADER_GAP}
-                      cardByPos={cardByPos}
-                      isCurrent={false}
-                      isDragged={false}
-                      isHovered={false}
-                    />
-                  </Animated.View>
-                )}
               </View>
             </GestureDetector>
-          </ScrollView>
+          </Animated.ScrollView>
+
+          {/* Dragged blob overlay — rendered OUTSIDE the ScrollView so it
+              sits at screen-absolute coordinates and doesn't move when the
+              auto-scroll fires. dragX/dragY are populated from the gesture's
+              absoluteX/absoluteY, so translate(dragX − blobW/2, dragY − blobH/2)
+              centers the blob on the finger regardless of scroll position. */}
+          {dragIdx !== null && pages[dragIdx] && (
+            <Animated.View
+              pointerEvents="none"
+              style={[{
+                position: 'absolute', left: 0, top: 0,
+                width: blobW, height: blobH, zIndex: 100, opacity: 0.92,
+              }, overlayStyle]}
+            >
+              <PageBlob
+                p={dragIdx}
+                pageTitle={pages[dragIdx]?.title}
+                blobW={blobW}
+                blobH={blobH}
+                innerW={innerW}
+                cardCols={cardCols}
+                cardRowsN={cardRowsN}
+                slotsPerPage={slotsPerPage}
+                miniCardW={miniCardW}
+                miniCardH={miniCardH}
+                miniGridH={miniGridH}
+                cardG={cardG}
+                blobPad={BLOB_PAD}
+                headerH={HEADER_H}
+                headerGap={HEADER_GAP}
+                cardByPos={cardByPos}
+                isCurrent={false}
+                isDragged={false}
+                isHovered={false}
+              />
+            </Animated.View>
+          )}
 
           <PageActionsSheet
             page={actionsPage}
@@ -1667,12 +2327,13 @@ function PageActionsSheet({
       navigationBarTranslucent
       onRequestClose={onClose}
     >
-      <View style={{ flex: 1, justifyContent: 'flex-end' }}>
+      <View style={{ flex: 1, justifyContent: 'flex-end', alignItems: 'center' }}>
         <Pressable
           onPress={onClose}
-          style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.6)' }}
+          style={{ flex: 1, alignSelf: 'stretch', backgroundColor: 'rgba(0,0,0,0.6)' }}
         />
         <View style={{
+          width: '100%', maxWidth: theme.maxContentW,
           backgroundColor: theme.surface,
           borderTopLeftRadius: theme.radius * 2,
           borderTopRightRadius: theme.radius * 2,

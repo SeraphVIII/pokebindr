@@ -16,7 +16,7 @@ import { useToast } from '@/components/Toast';
 import { theme } from '@/lib/theme';
 
 export default function SignIn() {
-  const { signIn, signUp, resetPassword } = useSession();
+  const { signIn } = useSession();
   const toast = useToast();
   const [mode, setMode] = useState<'signin' | 'signup'>('signin');
   const [email, setEmail] = useState('');
@@ -28,13 +28,17 @@ export default function SignIn() {
       toast.error('Email and password required.');
       return;
     }
+    // Self-service sign-up is intentionally disabled for now — accounts are
+    // provisioned by hand in the Supabase dashboard (no transactional email is
+    // configured yet, so the confirm-email step couldn't complete anyway). The
+    // page + toggle stay so the UI is unchanged; only the action fails.
+    if (mode === 'signup') {
+      toast.error('Account creation is invite-only right now. Ask the admin to set you up.');
+      return;
+    }
     setBusy(true);
     try {
-      if (mode === 'signin') await signIn(email.trim(), password);
-      else {
-        await signUp(email.trim(), password);
-        toast.success('Check your inbox to confirm your email.');
-      }
+      await signIn(email.trim(), password);
     } catch (e: any) {
       toast.error(e.message ?? 'Auth error');
     } finally {
@@ -42,21 +46,11 @@ export default function SignIn() {
     }
   };
 
-  const onForgotPassword = async () => {
-    const target = email.trim();
-    if (!target) {
-      toast.info('Type your email above first, then tap Forgot password.');
-      return;
-    }
-    setBusy(true);
-    try {
-      await resetPassword(target);
-      toast.success('Reset link sent. Check your inbox.');
-    } catch (e: any) {
-      toast.error(e.message ?? 'Could not send reset email');
-    } finally {
-      setBusy(false);
-    }
+  // Disabled alongside sign-up: no transactional email is configured, so a
+  // reset link couldn't be delivered. Passwords are reset by hand from the
+  // Supabase dashboard. The link stays visible but only explains this.
+  const onForgotPassword = () => {
+    toast.info('Password resets are handled by the admin — reach out to get yours reset.');
   };
 
   return (

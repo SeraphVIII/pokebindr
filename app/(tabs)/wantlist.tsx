@@ -1,7 +1,7 @@
 // Wantlist — Need first, then Want. Sum of "to acquire" cost.
 
-import { View, Text, ScrollView, Pressable, Image, RefreshControl } from 'react-native';
-import { useCallback, useRef, useState } from 'react';
+import { View, Text, ScrollView, Pressable, Image, RefreshControl, TextInput } from 'react-native';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { useRouter, useLocalSearchParams, useFocusEffect } from 'expo-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { Feather } from '@expo/vector-icons';
@@ -11,6 +11,14 @@ import { useCollection, useSetStatus } from '@/lib/queries';
 import { useToast } from '@/components/Toast';
 import { theme } from '@/lib/theme';
 import type { CollectionRow } from '@/lib/types';
+
+type Sort = 'recent' | 'name' | 'set' | 'price';
+const SORT_LABELS: Record<Sort, string> = {
+  recent: 'Recent',
+  name:   'Name',
+  set:    'Set',
+  price:  'Price',
+};
 
 export default function Wantlist() {
   const { data: rows = [] } = useCollection();
@@ -61,8 +69,50 @@ export default function Wantlist() {
     }
   };
 
-  const really = rows.filter((r) => r.status === 'really');
-  const want = rows.filter((r) => r.status === 'want');
+  const [search, setSearch] = useState('');
+  const [sort, setSort] = useState<Sort>('recent');
+
+  const applyFilterSort = useCallback((list: CollectionRow[]) => {
+    const term = search.trim().toLowerCase();
+    let out = list;
+    if (term) {
+      out = out.filter((r) =>
+        r.card_name.toLowerCase().includes(term)
+        || r.set_name.toLowerCase().includes(term)
+        || r.card_number.toLowerCase().includes(term),
+      );
+    }
+    const sorted = [...out];
+    switch (sort) {
+      case 'recent':
+        sorted.sort((a, b) => b.added_at.localeCompare(a.added_at));
+        break;
+      case 'name':
+        sorted.sort((a, b) => a.card_name.localeCompare(b.card_name));
+        break;
+      case 'set':
+        sorted.sort((a, b) => {
+          const s = a.set_name.localeCompare(b.set_name);
+          return s !== 0
+            ? s
+            : a.card_number.localeCompare(b.card_number, undefined, { numeric: true });
+        });
+        break;
+      case 'price':
+        sorted.sort((a, b) => (b.last_price_eur ?? -Infinity) - (a.last_price_eur ?? -Infinity));
+        break;
+    }
+    return sorted;
+  }, [search, sort]);
+
+  const really = useMemo(
+    () => applyFilterSort(rows.filter((r) => r.status === 'really')),
+    [rows, applyFilterSort],
+  );
+  const want = useMemo(
+    () => applyFilterSort(rows.filter((r) => r.status === 'want')),
+    [rows, applyFilterSort],
+  );
   const total = [...really, ...want].reduce((s, r) => s + (r.last_price_eur ?? 0), 0);
 
   return (
@@ -84,8 +134,65 @@ export default function Wantlist() {
         </Eyebrow>
         <Text style={{
           fontFamily: theme.fontDisplay,
-          fontSize: 30, color: theme.text, marginTop: 4,
+          fontSize: 30, color: theme.text, marginTop: 4, lineHeight: 40,
         }}>The hunt</Text>
+
+        <View style={{ marginTop: 18 }}>
+          <View style={{
+            flexDirection: 'row', alignItems: 'center', gap: 10,
+            backgroundColor: theme.surface,
+            borderWidth: 1, borderColor: theme.border,
+            borderRadius: theme.radius,
+            paddingHorizontal: 14, paddingVertical: 8,
+          }}>
+            <Feather name="search" size={16} color={theme.textDim} />
+            <TextInput
+              value={search}
+              onChangeText={setSearch}
+              placeholder="Name, set, or number…"
+              placeholderTextColor={theme.textMute}
+              autoCapitalize="none"
+              autoCorrect={false}
+              style={{
+                flex: 1, color: theme.text, fontSize: 14,
+                paddingVertical: 4,
+              }}
+            />
+            {search.length > 0 && (
+              <Pressable onPress={() => setSearch('')} hitSlop={6}>
+                <Feather name="x" size={16} color={theme.textDim} />
+              </Pressable>
+            )}
+          </View>
+
+          <View style={{
+            flexDirection: 'row', flexWrap: 'wrap', gap: 6,
+            marginTop: 12, alignItems: 'center',
+          }}>
+            <Eyebrow style={{ marginRight: 4, alignSelf: 'center' }}>Sort by</Eyebrow>
+            {(Object.keys(SORT_LABELS) as Sort[]).map((s) => {
+              const active = sort === s;
+              return (
+                <Pressable
+                  key={s}
+                  onPress={() => setSort(s)}
+                  style={{
+                    paddingHorizontal: 10, paddingVertical: 5,
+                    borderRadius: 999,
+                    borderWidth: 1,
+                    borderColor: active ? theme.accent : theme.border,
+                    backgroundColor: active ? theme.accent : 'transparent',
+                  }}>
+                  <Text style={{
+                    fontFamily: theme.fontUIBold, fontSize: 11,
+                    letterSpacing: 0.5, textTransform: 'uppercase',
+                    color: active ? theme.accentText : theme.textDim,
+                  }}>{SORT_LABELS[s]}</Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        </View>
 
         {really.length > 0 && (
           <Section
@@ -126,8 +233,14 @@ export default function Wantlist() {
             color: theme.textDim, textAlign: 'center',
             marginTop: 60, fontSize: 14,
           }}>
-            No cards on your wantlist yet.{'\n'}
-            Add a card and tap "Want" or "Need" on the detail screen.
+            {search.trim() ? (
+              <>No wantlist cards match “{search.trim()}”.</>
+            ) : (
+              <>
+                No cards on your wantlist yet.{'\n'}
+                Add a card and tap "Want" or "Need" on the detail screen.
+              </>
+            )}
           </Text>
         )}
       </ScrollView>
