@@ -1,15 +1,6 @@
-// Card detail — opens for any card_id. Pulls live data from PokemonTCG.io.
-//
-// If the card is NOT yet in any binder, shows an "Add to: BinderX" button
-// (BinderX = the first binder, typically "My Collection" / the bulk binder).
-// The binder name is itself tappable; it opens a bottom-anchored picker
-// (40% of screen height). The picker selection lives only for the current
-// screen — it's intentionally NOT persisted across cards or sessions, so the
-// add flow stays a generic "drop it in your default binder unless you pick".
-//
-// If the card IS in a binder, shows status pills and a trash icon to remove.
+// Card detail — status, pricing, and add-to-binder for a single card.
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import {
   View, Text, ScrollView, Image, Pressable, ActivityIndicator,
@@ -21,10 +12,16 @@ import { Feather } from '@expo/vector-icons';
 import { Screen } from '@/components/Screen';
 import { Eyebrow } from '@/components/Eyebrow';
 import { Chip } from '@/components/Chip';
+import { AmbientGlow, IconDisc, Skeleton } from '@/components/ui';
 import { Sparkline } from '@/components/Sparkline';
 import { useToast } from '@/components/Toast';
 import { useConfirm } from '@/components/ConfirmDialog';
 import { useContentWidth } from '@/lib/layout';
+import { fallbackImageUrls, type Locale } from '@/lib/tcgdex';
+import {
+  useEbaySolds, filterByGrade, averageSoldPrice,
+  type GradeFilter, type EbaySold,
+} from '@/lib/ebay';
 import {
   useCollectionItem, useCollectionRowById, useCollectionItemsByCardId,
   useTcgCard, useSetStatus, useRemoveCard, useBinders, useUpsertCard,
@@ -35,10 +32,8 @@ import type { Status, Binder, TcgCard, CollectionRow } from '@/lib/types';
 
 const CONDITIONS = ['NM', 'EX', 'GD', 'LP', 'MP', 'HP'] as const;
 
-// Open Cardmarket for this card. The URL is resolved server-side by the
-// cardmarket-resolve Edge Function (DDG !ducky lookup + ?language=1 appended)
-// and held in React Query; tapping the button just opens whatever the
-// cache holds. WebBrowser sidesteps Android's intent-dispatch quirks.
+// The URL is resolved server-side and held in React Query; the button opens
+// whatever the cache holds. WebBrowser sidesteps Android intent-dispatch quirks.
 async function openCardmarket(url: string | undefined, onError: (msg: string) => void) {
   try {
     if (!url) throw new Error('Still resolving Cardmarket link…');
@@ -49,25 +44,20 @@ async function openCardmarket(url: string | undefined, onError: (msg: string) =>
 }
 
 export default function CardDetail() {
-  // `id` = PokemonTCG.io card id. Optional `row` query param identifies
-  // a specific user-owned instance (since the same card_id can appear
-  // multiple times in a binder).
+  // Optional `row` query param identifies a specific instance; the same
+  // card_id can appear multiple times in a binder.
   const { id, row: rowParam, lang } = useLocalSearchParams<{ id: string; row?: string; lang?: string }>();
-  const locale: 'en' | 'ja' = lang === 'ja' ? 'ja' : 'en';
+  const locale: Locale = lang === 'ja' ? 'ja' : 'en';
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const toast = useToast();
   const confirm = useConfirm();
   const { data: card, isLoading: loadingCard, error: cardError } = useTcgCard(id, locale);
-  // If a row is specified, look it up directly. Otherwise the user came
-  // from a context that doesn't know about a specific instance (e.g. search)
-  // — show info-only with an Add button.
   const { data: rowById } = useCollectionRowById(rowParam);
   const { data: allInstances = [] } = useCollectionItemsByCardId(rowParam ? undefined : id);
   const { data: fallbackRow } = useCollectionItem(rowParam ? undefined : id);
-  // In instance mode (row param set): row = the specific instance.
-  // In aggregate mode (no row param): row stays null; the screen shows the
-  // "Your copies" breakdown instead of the instance controls.
+  // Instance mode (row param set) shows the instance controls; aggregate
+  // mode leaves row null and shows the copies breakdown instead.
   const row = rowParam ? rowById : null;
   void fallbackRow;
   const { data: binders = [] } = useBinders();
@@ -82,26 +72,33 @@ export default function CardDetail() {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [chosenBinderId, setChosenBinderId] = useState<string | null>(null);
 
-  // Default the picker selection to the first binder (typically the bulk
-  // "My Collection" binder). Per-screen explicit picks override; no
-  // cross-card / cross-session memory of the last binder used.
   const targetBinderId = useMemo(() => {
     if (chosenBinderId && binders.some((b) => b.id === chosenBinderId)) return chosenBinderId;
     return binders[0]?.id ?? null;
   }, [chosenBinderId, binders]);
   const targetBinder = binders.find((b) => b.id === targetBinderId) ?? null;
 
-  // All hooks must run on every render; compute fallback off card?. so the
-  // hook runs even while `card` is loading.
+  // Hooks must run on every render, so these compute off card?. rather than
+  // sitting below the early returns.
   const tcgFallback = useMemo(() => pickTcgplayerPrice(card?.tcgplayer), [card?.tcgplayer]);
-  // Pre-resolve the Cardmarket URL while the user is reading the page so
-  // tapping the button is instant. Hook safely no-ops while `card` is null.
+  // Pre-resolve the Cardmarket URL so tapping the button is instant; the
+  // hook no-ops while `card` is null.
   const { data: cmUrl, isLoading: cmLoading } = useCardmarketUrl(card);
 
   if (loadingCard) {
     return (
-      <Screen style={{ alignItems: 'center', justifyContent: 'center' }}>
-        <ActivityIndicator color={theme.accent} />
+      <Screen edges={['top', 'left', 'right']}>
+        <View style={{ paddingHorizontal: 14, paddingTop: 6 }}>
+          <IconDisc name="chevron-left" onPress={() => router.back()} />
+        </View>
+        <View style={{ alignItems: 'center', paddingTop: 16 }}>
+          <Skeleton width={220} height={308} radius={14} />
+        </View>
+        <View style={{ paddingHorizontal: 24, marginTop: 24, gap: 10 }}>
+          <Skeleton width={140} height={10} radius={5} />
+          <Skeleton width={230} height={28} radius={10} />
+          <Skeleton height={110} radius={theme.radiusLg} style={{ marginTop: 14 }} />
+        </View>
       </Screen>
     );
   }
@@ -109,9 +106,7 @@ export default function CardDetail() {
     return (
       <Screen edges={['top', 'left', 'right']}>
         <View style={{ paddingHorizontal: 14, paddingTop: 6 }}>
-          <Pressable onPress={() => router.back()} hitSlop={12}>
-            <Feather name="arrow-left" size={22} color={theme.textDim} />
-          </Pressable>
+          <IconDisc name="chevron-left" onPress={() => router.back()} />
         </View>
         <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 }}>
           <Text style={{ color: theme.textDim, fontSize: 14, textAlign: 'center' }}>
@@ -135,10 +130,8 @@ export default function CardDetail() {
   const currency = usingCM ? '€' : '$';
   const priceSource = usingCM ? 'Cardmarket · EU' : tcgFallback ? 'TCGplayer · US' : null;
 
-  // Approximate trend over the past month using progressively shorter rolling
-  // windows ending at "now". Not a real time series (each value is an average
-  // of an overlapping window, not a price at a point in time), so the chart
-  // is suggestive of direction only. Replace once V2 price_snapshots land.
+  // Not a real time series: each value is an overlapping rolling-window
+  // average, so the sparkline only suggests direction.
   const series = (usingCM
     ? [prices?.avg30, prices?.avg7, prices?.avg1, prices?.trendPrice]
     : [tcgFallback?.low, tcgFallback?.mid, tcgFallback?.market, tcgFallback?.high]
@@ -179,15 +172,13 @@ export default function CardDetail() {
     try {
       await upsert.mutateAsync({ card, status: 'have', binderId: targetBinder.id });
       // Stay in aggregate mode so the stepper can keep accumulating copies.
-      // The "Your copies" breakdown below the stepper updates automatically.
     } catch (e: any) {
       toast.error(e.message ?? 'Could not add card');
     }
   };
 
-  // Remove one copy of this card from the currently selected binder. We
-  // delete the most recently added row so it pairs naturally with the +
-  // button (last-in-first-out).
+  // Removes the most recently added copy in the selected binder
+  // (last in, first out).
   const handleRemoveOne = async () => {
     if (!targetBinder) return;
     const here = allInstances.filter((r) => r.binder_id === targetBinder.id);
@@ -213,32 +204,34 @@ export default function CardDetail() {
         flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
         padding: 14,
       }}>
-        <Pressable onPress={() => router.back()} hitSlop={12}>
-          <Feather name="arrow-left" size={22} color={theme.textDim} />
-        </Pressable>
+        <IconDisc name="chevron-left" onPress={() => router.back()} />
         {row && (
-          <Pressable onPress={removeFromBinder} hitSlop={12}>
-            <Feather name="trash-2" size={18} color={theme.textDim} />
-          </Pressable>
+          <IconDisc name="trash-2" iconSize={15} onPress={removeFromBinder} />
         )}
       </View>
 
       <ScrollView contentContainerStyle={{ paddingBottom: 40 }}>
         <View style={{ alignItems: 'center', paddingVertical: 8 }}>
-          <Image
-            source={{ uri: card.images.large }}
-            style={{ width: 220, height: 308, borderRadius: 12 }}
-            resizeMode="contain"
-          />
+          <AmbientGlow size={340} style={{ top: -40, alignSelf: 'center' }} opacity={0.14} />
+          <View style={{ borderRadius: 14, boxShadow: theme.shadowAmbient }}>
+            <HeroArt
+              card={card}
+              instanceArt={
+                row?.image_large ?? row?.image_small
+                ?? allInstances[0]?.image_large ?? allInstances[0]?.image_small
+                ?? null
+              }
+            />
+          </View>
         </View>
 
-        <View style={{ paddingHorizontal: 24, marginTop: 12 }}>
+        <View style={{ paddingHorizontal: 24, marginTop: 14 }}>
           <Eyebrow>
             {card.set.name} · {card.number}{card.rarity ? ` · ${card.rarity}` : ''}
           </Eyebrow>
           <Text style={{
-            fontFamily: theme.fontDisplay,
-            fontSize: 32, color: theme.text, marginTop: 4, lineHeight: 42,
+            fontFamily: theme.fontDisplaySemi,
+            fontSize: 32, color: theme.text, marginTop: 4, lineHeight: 40,
           }}>{card.name}</Text>
           {card.hp && (
             <Text style={{ color: theme.textDim, fontSize: 13, marginTop: 6 }}>
@@ -255,7 +248,6 @@ export default function CardDetail() {
                 <Chip label="Need" active={row.status === 'really'} color={theme.statusReally} onPress={() => pickStatus('really')} />
               </View>
 
-              {/* condition (per-instance) */}
               <View style={{ marginTop: 18 }}>
                 <Eyebrow style={{ marginBottom: 6 }}>Condition</Eyebrow>
                 <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 4 }}>
@@ -268,16 +260,17 @@ export default function CardDetail() {
                           rowId: row.id,
                           fields: { condition: c },
                         })}
-                        style={{
-                          paddingHorizontal: 12, paddingVertical: 7,
-                          borderRadius: theme.radius,
+                        style={({ pressed }) => ({
+                          paddingHorizontal: 13, paddingVertical: 8,
+                          borderRadius: theme.pill,
                           borderWidth: 1,
-                          borderColor: active ? theme.accent : theme.border,
-                          backgroundColor: active ? theme.accent : 'transparent',
-                        }}>
+                          borderColor: active ? theme.accent : theme.hairline,
+                          backgroundColor: active ? theme.accentSoft : theme.glass,
+                          transform: [{ scale: pressed ? 0.94 : 1 }],
+                        })}>
                         <Text style={{
                           fontFamily: theme.fontMono, fontSize: 11,
-                          color: active ? theme.accentText : theme.textDim,
+                          color: active ? theme.accent : theme.textDim,
                         }}>{c}</Text>
                       </Pressable>
                     );
@@ -308,13 +301,18 @@ export default function CardDetail() {
           )}
         </View>
 
-        <View style={{ paddingHorizontal: 24, marginTop: 22 }}>
+        <EbaySoldsSection card={card} />
+
+        <View style={{ paddingHorizontal: 24, marginTop: 24 }}>
           <View style={{
             backgroundColor: theme.surface,
-            borderWidth: 1, borderColor: theme.border,
-            borderRadius: theme.radius * 1.5,
-            padding: 16,
+            borderWidth: 1, borderColor: theme.hairline,
+            borderRadius: theme.radiusLg,
+            padding: 18,
+            overflow: 'hidden',
+            boxShadow: `${theme.shadowSoft}, ${theme.shadowInner}`,
           }}>
+            <AmbientGlow size={220} style={{ top: -110, right: -80 }} opacity={0.12} />
             <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end' }}>
               <View>
                 <Eyebrow>
@@ -325,7 +323,7 @@ export default function CardDetail() {
                   fontSize: 32, color: theme.text, marginTop: 4, lineHeight: 38,
                   letterSpacing: -0.3,
                 }}>
-                  {avg != null ? `${currency}${avg.toFixed(2)}` : '—'}
+                  {avg != null ? `${currency}${avg.toFixed(2)}` : '·'}
                 </Text>
               </View>
               {low != null && (
@@ -384,24 +382,32 @@ export default function CardDetail() {
             <Pressable
               onPress={() => openCardmarket(cmUrl, toast.error)}
               disabled={cmLoading}
-              style={{
+              style={({ pressed }) => ({
                 flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
-                gap: 8,
+                gap: 10,
                 paddingVertical: 14,
                 borderWidth: 1, borderColor: theme.borderStrong,
-                borderRadius: theme.radius,
+                borderRadius: theme.pill,
+                backgroundColor: pressed ? theme.accentSoft : theme.glass,
                 opacity: cmLoading ? 0.6 : 1,
-              }}>
-              {cmLoading ? (
-                <ActivityIndicator color={theme.accent} size="small" />
-              ) : (
-                <Feather name="external-link" size={14} color={theme.accent} />
-              )}
+                transform: [{ scale: pressed ? 0.98 : 1 }],
+              })}>
               <Text style={{
                 color: theme.accent, fontSize: 13,
                 fontFamily: theme.fontUIBold, letterSpacing: 0.5,
                 textTransform: 'uppercase',
               }}>Buy on Cardmarket · EN</Text>
+              <View style={{
+                width: 24, height: 24, borderRadius: theme.pill,
+                backgroundColor: theme.accentSoft,
+                alignItems: 'center', justifyContent: 'center',
+              }}>
+                {cmLoading ? (
+                  <ActivityIndicator color={theme.accent} size="small" />
+                ) : (
+                  <Feather name="external-link" size={12} color={theme.accent} />
+                )}
+              </View>
             </Pressable>
           </View>
         )}
@@ -418,34 +424,41 @@ export default function CardDetail() {
         <View style={{ flex: 1, justifyContent: 'flex-end', alignItems: 'center' }}>
           <Pressable
             onPress={() => setPickerOpen(false)}
-            style={{ flex: 1, alignSelf: 'stretch', backgroundColor: 'rgba(0,0,0,0.6)' }}
+            style={{ flex: 1, alignSelf: 'stretch', backgroundColor: theme.scrim }}
           />
           <View style={{
             width: '100%', maxWidth: theme.maxContentW,
             height: winH * 0.4 + insets.bottom,
             backgroundColor: theme.surface,
-            borderTopLeftRadius: theme.radius * 2,
-            borderTopRightRadius: theme.radius * 2,
+            borderTopLeftRadius: theme.radiusXl,
+            borderTopRightRadius: theme.radiusXl,
             borderTopWidth: 1, borderLeftWidth: 1, borderRightWidth: 1,
-            borderColor: theme.borderStrong,
-            paddingHorizontal: 20, paddingTop: 18,
+            borderColor: theme.hairline,
+            paddingHorizontal: 20, paddingTop: 12,
             paddingBottom: 24 + insets.bottom,
+            boxShadow: theme.shadowInner,
           }}>
+            <View style={{
+              alignSelf: 'center', width: 36, height: 4, borderRadius: 2,
+              backgroundColor: theme.glassStrong, marginBottom: 12,
+            }} />
             <Eyebrow>Add to</Eyebrow>
             <Text style={{
-              fontFamily: theme.fontDisplay,
-              fontSize: 20, color: theme.text, marginTop: 4, marginBottom: 12,
+              fontFamily: theme.fontDisplaySemi,
+              fontSize: 21, color: theme.text, marginTop: 4, marginBottom: 12,
             }}>Choose a binder</Text>
             <ScrollView>
               {binders.map((b) => (
                 <Pressable
                   key={b.id}
                   onPress={() => choose(b)}
-                  style={{
+                  style={({ pressed }) => ({
                     flexDirection: 'row', alignItems: 'center',
-                    paddingVertical: 14, paddingHorizontal: 4,
-                    borderBottomWidth: 1, borderBottomColor: theme.border,
-                  }}>
+                    paddingVertical: 14, paddingHorizontal: 8,
+                    borderRadius: theme.radiusSm,
+                    backgroundColor: pressed ? theme.accentFaint : 'transparent',
+                    borderBottomWidth: 1, borderBottomColor: theme.hairline,
+                  })}>
                   <View style={{ flex: 1 }}>
                     <Text style={{
                       color: b.id === targetBinderId ? theme.accent : theme.text,
@@ -474,6 +487,50 @@ export default function CardDetail() {
   );
 }
 
+// Hero artwork fallback chain: hires render, low-res render, stored instance
+// art, then the CDN guess. Advances on load error; a named placeholder
+// renders if every candidate fails.
+function HeroArt({ card, instanceArt }: { card: TcgCard; instanceArt: string | null }) {
+  const candidates = useMemo(() => {
+    const fb = fallbackImageUrls(card.set.id, card.number);
+    const list = [card.images.large, card.images.small, instanceArt, fb.large, fb.small]
+      .filter((u): u is string => !!u);
+    return [...new Set(list)];
+  }, [card, instanceArt]);
+  const [idx, setIdx] = useState(0);
+  useEffect(() => { setIdx(0); }, [candidates]);
+  const uri = candidates[idx];
+
+  if (!uri) {
+    return (
+      <View style={{
+        width: 220, height: 308, borderRadius: 14,
+        backgroundColor: theme.cardBg,
+        borderWidth: 1, borderColor: theme.hairline,
+        alignItems: 'center', justifyContent: 'center', padding: 16,
+      }}>
+        <Text style={{
+          fontFamily: theme.fontDisplaySemi, fontSize: 22,
+          color: theme.text, textAlign: 'center',
+        }}>{card.name}</Text>
+        <Text style={{
+          fontFamily: theme.fontMono, fontSize: 11,
+          color: theme.textDim, marginTop: 8,
+        }}>{card.set.name} · {card.number}</Text>
+      </View>
+    );
+  }
+  return (
+    <Image
+      key={uri}
+      source={{ uri }}
+      onError={() => setIdx((i) => i + 1)}
+      style={{ width: 220, height: 308, borderRadius: 14 }}
+      resizeMode="contain"
+    />
+  );
+}
+
 function AddStepper({
   binder, instances, busy,
   onAdd, onRemoveOne, onChangeBinder,
@@ -493,8 +550,9 @@ function AddStepper({
       marginTop: 16,
       backgroundColor: theme.surface,
       borderWidth: 1, borderColor: theme.borderStrong,
-      borderRadius: theme.radius,
-      padding: 14,
+      borderRadius: theme.radiusLg,
+      padding: 16,
+      boxShadow: theme.shadowInner,
     }}>
       <Eyebrow>Add to binder</Eyebrow>
       <View style={{
@@ -548,14 +606,16 @@ function StepperBtn({
       onPress={onPress}
       disabled={disabled}
       hitSlop={6}
-      style={{
-        width: 34, height: 34, borderRadius: 17,
+      style={({ pressed }) => ({
+        width: 36, height: 36, borderRadius: 18,
         borderWidth: 1,
-        borderColor: disabled ? theme.border : theme.accent,
-        backgroundColor: disabled ? 'transparent' : theme.accent,
+        borderColor: disabled ? theme.hairline : theme.accent,
+        backgroundColor: disabled ? theme.glass : theme.accent,
         alignItems: 'center', justifyContent: 'center',
         opacity: disabled ? 0.4 : 1,
-      }}>
+        boxShadow: disabled ? undefined : theme.shadowGold,
+        transform: [{ scale: pressed && !disabled ? 0.9 : 1 }],
+      })}>
       <Feather
         name={icon}
         size={16}
@@ -573,7 +633,6 @@ function CopiesBreakdown({
   onTapInstance: (rowId: string) => void;
 }) {
   const binderName = new Map(binders.map((b) => [b.id, b.name]));
-  // Group instances by condition; within each condition, list the binders.
   const groups = new Map<string, typeof instances>();
   for (const r of instances) {
     if (!groups.has(r.condition)) groups.set(r.condition, []);
@@ -588,17 +647,18 @@ function CopiesBreakdown({
     <View style={{ marginTop: 18 }}>
       <Eyebrow style={{ marginBottom: 8 }}>Your copies · {instances.length}</Eyebrow>
       <View style={{
-        borderWidth: 1, borderColor: theme.border,
-        borderRadius: theme.radius,
+        borderWidth: 1, borderColor: theme.hairline,
+        borderRadius: theme.radiusLg,
         backgroundColor: theme.surface,
         overflow: 'hidden',
+        boxShadow: theme.shadowInner,
       }}>
         {ordered.map(([condition, rows], gi) => (
           <View
             key={condition}
             style={{
               borderTopWidth: gi === 0 ? 0 : 1,
-              borderTopColor: theme.border,
+              borderTopColor: theme.hairline,
             }}>
             <View style={{
               flexDirection: 'row', alignItems: 'baseline',
@@ -623,8 +683,8 @@ function CopiesBreakdown({
                   flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
                   paddingHorizontal: 14, paddingVertical: 8,
                 }}>
-                <Text style={{ color: theme.textDim, fontSize: 13 }}>
-                  in {binderName.get(r.binder_id) ?? '—'}
+                <Text style={{ color: theme.textDim, fontSize: 13, fontFamily: theme.fontUI }}>
+                  in {binderName.get(r.binder_id) ?? 'unknown binder'}
                 </Text>
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
                   <View style={{
@@ -644,17 +704,211 @@ function CopiesBreakdown({
   );
 }
 
+// ─────────────────────────────────────────────────────────────
+// eBay UK last solds
+// ─────────────────────────────────────────────────────────────
+
+const GRADE_TABS: Array<{ key: GradeFilter; label: string }> = [
+  { key: 'all', label: 'All' },
+  { key: 'raw', label: 'Raw' },
+  { key: 'psa9', label: 'PSA 9' },
+  { key: 'psa10', label: 'PSA 10' },
+];
+
+function EbaySoldsSection({ card }: { card: TcgCard }) {
+  const { data, isLoading } = useEbaySolds(card);
+  const [grade, setGrade] = useState<GradeFilter>('all');
+  const toast = useToast();
+
+  const openUrl = async (url: string | null) => {
+    if (!url) return;
+    try {
+      await WebBrowser.openBrowserAsync(url);
+    } catch (e: any) {
+      toast.error(e?.message ?? 'Could not open eBay');
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <View style={{ paddingHorizontal: 24, marginTop: 24, gap: 10 }}>
+        <Skeleton width={150} height={10} radius={5} />
+        <Skeleton height={120} radius={theme.radiusLg} />
+      </View>
+    );
+  }
+  if (!data) return null;
+
+  if (data.items.length === 0) {
+    return (
+      <View style={{ paddingHorizontal: 24, marginTop: 24 }}>
+        <View style={{
+          flexDirection: 'row', alignItems: 'center', gap: 10,
+          backgroundColor: theme.glass,
+          borderWidth: 1, borderColor: theme.hairline,
+          borderRadius: theme.radius,
+          paddingHorizontal: 14, paddingVertical: 12,
+          boxShadow: theme.shadowInner,
+        }}>
+          <Feather name="tag" size={13} color={theme.textDim} />
+          <Text style={{ flex: 1, color: theme.textDim, fontSize: 12, fontFamily: theme.fontUI }}>
+            {data.failed
+              ? 'eBay UK solds unavailable right now — showing Cardmarket pricing below.'
+              : 'No recent UK solds found — showing Cardmarket pricing below.'}
+          </Text>
+          <Pressable onPress={() => openUrl(data.searchUrl)} hitSlop={8}>
+            <Text style={{
+              color: theme.accent, fontSize: 11, fontFamily: theme.fontUIBold,
+              letterSpacing: 0.4, textTransform: 'uppercase',
+            }}>eBay</Text>
+          </Pressable>
+        </View>
+      </View>
+    );
+  }
+
+  const filtered = filterByGrade(data.items, grade);
+  const avg = averageSoldPrice(filtered, 5);
+  const avgCount = Math.min(5, filtered.length);
+  const counts: Record<GradeFilter, number> = {
+    all: data.items.length,
+    raw: filterByGrade(data.items, 'raw').length,
+    psa9: filterByGrade(data.items, 'psa9').length,
+    psa10: filterByGrade(data.items, 'psa10').length,
+  };
+  const shown = filtered.slice(0, 8);
+
+  return (
+    <View style={{ paddingHorizontal: 24, marginTop: 24 }}>
+      <View style={{
+        backgroundColor: theme.surface,
+        borderWidth: 1, borderColor: theme.hairline,
+        borderRadius: theme.radiusLg,
+        padding: 18,
+        overflow: 'hidden',
+        boxShadow: `${theme.shadowSoft}, ${theme.shadowInner}`,
+      }}>
+        <AmbientGlow size={220} style={{ top: -110, left: -80 }} opacity={0.12} />
+
+        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end' }}>
+          <View>
+            <Eyebrow>
+              Last solds · eBay UK{data.stale ? ' · cached' : ''}
+            </Eyebrow>
+            <Text style={{
+              fontFamily: theme.fontMono,
+              fontSize: 32, color: theme.text, marginTop: 4, lineHeight: 38,
+              letterSpacing: -0.3,
+            }}>
+              {avg != null ? `£${avg.toFixed(2)}` : '·'}
+            </Text>
+            <Text style={{
+              color: theme.textDim, fontSize: 10, fontFamily: theme.fontMono,
+              marginTop: 2, letterSpacing: 0.5,
+            }}>
+              {avg != null
+                ? `avg of last ${avgCount} ${avgCount === 1 ? 'sale' : 'sales'}`
+                : 'no sales match this filter'}
+            </Text>
+          </View>
+          {data.fetchedAt && (
+            <Text style={{
+              color: theme.textDim, fontSize: 10, fontFamily: theme.fontMono,
+              letterSpacing: 0.5,
+            }}>
+              as of {data.fetchedAt.slice(0, 10)}
+            </Text>
+          )}
+        </View>
+
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 14 }}>
+          {GRADE_TABS.map((t) => (
+            (t.key === 'all' || counts[t.key] > 0) && (
+              <Chip
+                key={t.key}
+                label={`${t.label} · ${counts[t.key]}`}
+                active={grade === t.key}
+                onPress={() => setGrade(t.key)}
+              />
+            )
+          ))}
+        </View>
+
+        <View style={{ marginTop: 12 }}>
+          {shown.map((item, i) => (
+            <SoldRow key={item.url ?? `${i}`} item={item} first={i === 0} onPress={() => openUrl(item.url ?? data.searchUrl)} />
+          ))}
+        </View>
+
+        <Pressable
+          onPress={() => openUrl(data.searchUrl)}
+          style={({ pressed }) => ({
+            flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8,
+            marginTop: 14, paddingVertical: 10,
+            borderWidth: 1, borderColor: theme.hairline,
+            borderRadius: theme.pill,
+            backgroundColor: pressed ? theme.accentSoft : theme.glass,
+            transform: [{ scale: pressed ? 0.98 : 1 }],
+          })}>
+          <Text style={{
+            color: theme.accent, fontSize: 11, fontFamily: theme.fontUIBold,
+            letterSpacing: 0.5, textTransform: 'uppercase',
+          }}>See all solds on eBay UK</Text>
+          <Feather name="external-link" size={11} color={theme.accent} />
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
+function SoldRow({ item, first, onPress }: { item: EbaySold; first: boolean; onPress: () => void }) {
+  const meta = [
+    item.soldAt ? `Sold ${item.soldAt.slice(0, 10)}` : null,
+    item.grade ? `${item.grade.grader} ${item.grade.grade}` : item.condition,
+  ].filter(Boolean).join(' · ');
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => ({
+        flexDirection: 'row', alignItems: 'center', gap: 10,
+        paddingVertical: 10,
+        borderTopWidth: first ? 0 : 1, borderTopColor: theme.hairline,
+        opacity: pressed ? 0.7 : 1,
+      })}>
+      <View style={{ flex: 1, minWidth: 0 }}>
+        <Text
+          numberOfLines={2}
+          style={{ color: theme.text, fontSize: 12, fontFamily: theme.fontUI, lineHeight: 16 }}
+        >
+          {item.title}
+        </Text>
+        {!!meta && (
+          <Text style={{
+            color: theme.textDim, fontSize: 10, fontFamily: theme.fontMono,
+            marginTop: 3, letterSpacing: 0.3,
+          }}>
+            {meta}
+          </Text>
+        )}
+      </View>
+      <Text style={{
+        color: theme.accent, fontSize: 14, fontFamily: theme.fontMono, fontWeight: '600',
+      }}>
+        £{item.price.toFixed(2)}
+      </Text>
+    </Pressable>
+  );
+}
+
 function PriceRow({ label, value, currency }: { label: string; value: number; currency: string }) {
   return (
     <View style={{
       flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
       paddingVertical: 12, paddingRight: 14, paddingLeft: 14,
-      backgroundColor: theme.surface,
-      borderWidth: 1, borderColor: theme.border,
-      // Gold left edge frames each row as a museum label — also mirrors the
-      // Toast component's stripe so the price table feels part of the system.
-      borderLeftWidth: 3, borderLeftColor: theme.accent2,
+      backgroundColor: theme.glass,
+      borderWidth: 1, borderColor: theme.hairline,
       borderRadius: theme.radius,
+      boxShadow: theme.shadowInner,
     }}>
       <Text style={{
         color: theme.textDim, fontSize: 12, fontFamily: theme.fontMono,

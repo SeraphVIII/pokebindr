@@ -1,12 +1,6 @@
-// Edge Function: resolve a Cardmarket product URL for a given card and
-// append ?language=1 so the user lands on the English-listings view.
-//
-// Strategy: scrape DDG's no-JS HTML search results for the first
-// cardmarket.com/Singles link. Google's basic-HTML SERP no longer renders
-// without JS, and Brave's API works but requires a key. DDG-html is
-// scrape-friendly out of the box; ranking can be off for niche queries
-// (e.g. picking #165 over #166), so we quote the number to force the
-// ranker to require it.
+// Edge Function: resolve a Cardmarket product URL for a card, with
+// ?language=1 appended for the English-listings view. Scrapes DuckDuckGo's
+// no-JS HTML results for the first cardmarket.com/Singles link.
 //
 // Deploy: `supabase functions deploy cardmarket-resolve --no-verify-jwt`
 
@@ -23,8 +17,7 @@ const UA =
   '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 // TCGdex set id → Cardmarket set code. Cardmarket URLs end with
-// "-{CODE}{number}" (e.g. "-CRE166"), so including the code as a
-// quoted token tightens the search hit dramatically vs. set name alone.
+// "-{CODE}{number}" (e.g. "-CRE166"), so quoting the code tightens the search.
 const SET_CODES: Record<string, string> = {
   // Scarlet & Violet era
   sv01: 'SVI', sv02: 'PAL', sv03: 'OBF', 'sv03.5': 'MEW',
@@ -60,9 +53,9 @@ function appendLanguage(url: string): string {
   }
 }
 
-// Pull the first Cardmarket Singles URL out of DDG's HTML page. DDG-html
-// sometimes wraps result links in a redirector (/l/?uddg=ENCODED), other
-// times exposes the URL directly — handle both.
+// First Cardmarket Singles URL in the DDG HTML page. DDG sometimes wraps
+// result links in a redirector (/l/?uddg=ENCODED), sometimes exposes the
+// URL directly; both are handled.
 function extractCardmarketUrl(html: string): string | null {
   const redirectorMatches = html.matchAll(/[?&]uddg=([^&"'\s]+)/g);
   for (const m of redirectorMatches) {
@@ -91,9 +84,8 @@ serve(async (req: Request) => {
       );
     }
 
-    // Quote setcode and number separately. The code is tighter than the
-    // verbose set name (e.g. "CRE" vs "Chilling Reign") and the number
-    // pins the right card in the set. Both quoted = both required.
+    // Quoted tokens are required terms: the set code narrows better than the
+    // set name, and the number pins the card within the set.
     const code = setId ? SET_CODES[setId] : undefined;
     const tokens: string[] = [name];
     if (code) tokens.push(`"${code}"`); else tokens.push(set);
