@@ -19,3 +19,13 @@ android/
 
 # Metro
 .metro-health-check*
+
+# Design notes + DB migrations stay local
+DESIGN.md
+supabase/*.sql
+
+# WSL metadata
+*Zone.Identifier*
+
+# Supabase CLI cache
+supabase/.temp/
