@@ -1,6 +1,4 @@
-// Binders tab — list of all the user's binders. Tap one to enter it.
-// Drag the left handle on a binder to reorder them; new order persists
-// to the DB via useReorderBinders.
+// Binders list screen.
 
 import { View, Text, Pressable, RefreshControl, Platform, Modal, TextInput, KeyboardAvoidingView } from 'react-native';
 import { useState } from 'react';
@@ -15,9 +13,10 @@ import ReorderableList, {
 import { runOnJS } from 'react-native-reanimated';
 import { Screen } from '@/components/Screen';
 import { Eyebrow } from '@/components/Eyebrow';
+import { Button, IconDisc, Skeleton } from '@/components/ui';
 import {
   useBinders, useCollection, useReorderBinders, useDeleteBinder, useRenameBinder,
-  useExportBinder, useImportBinder,
+  useExportBinder, useImportBinder, useDuplicateBinder,
 } from '@/lib/queries';
 import { useToast } from '@/components/Toast';
 import { useConfirm } from '@/components/ConfirmDialog';
@@ -34,20 +33,17 @@ export default function BindersList() {
   const renameBinder = useRenameBinder();
   const exportBinder = useExportBinder();
   const importBinder = useImportBinder();
+  const duplicateBinder = useDuplicateBinder();
   const toast = useToast();
   const confirm = useConfirm();
   const router = useRouter();
   const qc = useQueryClient();
   const [refreshing, setRefreshing] = useState(false);
-  // While an item is being dragged, suppress pull-to-refresh — otherwise the
-  // vertical drag triggers the RefreshControl spinner at the top of the list.
+  // Pull-to-refresh is disabled while dragging; the drag's vertical movement
+  // would otherwise trigger the RefreshControl spinner.
   const [dragging, setDragging] = useState(false);
-  // Rename modal target: the binder currently being renamed (null when closed).
-  // Keep the whole binder so we can show the original name for context.
   const [renameTarget, setRenameTarget] = useState<Binder | null>(null);
   const [renameDraft, setRenameDraft] = useState('');
-  // The binder whose actions menu is currently open (rename / export / delete).
-  // Mutually exclusive with renameTarget — opening rename closes the menu.
   const [menuTarget, setMenuTarget] = useState<Binder | null>(null);
   const closeMenu = () => setMenuTarget(null);
 
@@ -79,11 +75,20 @@ export default function BindersList() {
     }
   };
 
+  const onDuplicate = async (binder: Binder) => {
+    try {
+      const dup = await duplicateBinder.mutateAsync(binder.id);
+      toast.success(`Duplicated as "${dup.name}"`);
+    } catch (e: any) {
+      toast.error(e?.message ?? 'Could not duplicate binder');
+    }
+  };
+
   const onExport = async (binder: Binder) => {
     try {
       const { json, name } = await exportBinder.mutateAsync(binder.id);
       const filename = await exportBinderToFile(json, name);
-      if (filename) toast.success(`Saved ${filename}`);
+      if (filename) toast.success('Saved to Downloads');
     } catch (e: any) {
       toast.error(e?.message ?? 'Could not export binder');
     }
@@ -131,82 +136,56 @@ export default function BindersList() {
     setRefreshing(false);
   };
 
-  // DraggableFlatList tracks the drag-preview order itself, and
-  // useReorderBinders does an optimistic cache update on drop — so we
-  // can render directly off `binders` without a local mirror.
-
-  // Cheap client-side count per binder.
   const countByBinder = collection.reduce<Record<string, number>>((acc, r) => {
     acc[r.binder_id] = (acc[r.binder_id] ?? 0) + 1;
     return acc;
   }, {});
 
   const Header = (
-    // No horizontal padding here — the FlatList's contentContainerStyle
-    // already insets us 24px, so adding more would make the header
-    // narrower than the binder rows below it.
-    <View style={{ paddingTop: 24, paddingBottom: 10 }}>
-      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline' }}>
+    // Sticky list header (stickyHeaderIndices=[0]). Opaque background so rows
+    // scroll under it; horizontal padding comes from contentContainerStyle.
+    <View style={{ paddingTop: 24, paddingBottom: 8, backgroundColor: theme.bg }}>
+      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
         <View>
           <Eyebrow>Your binders</Eyebrow>
           <Text style={{
-            fontFamily: theme.fontDisplay,
+            fontFamily: theme.fontDisplaySemi,
             fontSize: 28, color: theme.text, marginTop: 4, lineHeight: 36,
           }}>Collection</Text>
         </View>
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-          <Pressable
-            onPress={onImport}
-            disabled={importBinder.isPending}
-            accessibilityLabel="Import a .pkbinder file"
-            style={{
-              width: 34, height: 34, borderRadius: theme.radius,
-              borderWidth: 1, borderColor: theme.border,
-              alignItems: 'center', justifyContent: 'center',
-              opacity: importBinder.isPending ? 0.5 : 1,
-            }}>
-            <Feather name="upload" size={14} color={theme.textDim} />
-          </Pressable>
-          <Pressable
-            onPress={() => router.push('/binder/new')}
-            style={{
-              flexDirection: 'row', alignItems: 'center', gap: 6,
-              paddingHorizontal: 12, paddingVertical: 8,
-              borderRadius: theme.radius,
-              backgroundColor: theme.accent,
-            }}>
-            <Feather name="plus" size={14} color={theme.accentText} />
-            <Text style={{
-              color: theme.accentText, fontSize: 12,
-              fontFamily: theme.fontUIBold, letterSpacing: 0.5,
-              textTransform: 'uppercase',
-            }}>New</Text>
-          </Pressable>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+          <IconDisc
+            name="upload"
+            iconSize={15}
+            onPress={importBinder.isPending ? undefined : onImport}
+            style={{ opacity: importBinder.isPending ? 0.5 : 1 }}
+          />
+          <Button label="New" small icon="plus" onPress={() => router.push('/binder/new')} />
         </View>
       </View>
 
       <View style={{ marginTop: 20, gap: 10 }}>
-        {/* Flat all-cards list — distinct from the grid binders below. */}
         <Pressable
           onPress={() => router.push('/collection')}
-          style={{
+          style={({ pressed }) => ({
             flexDirection: 'row', alignItems: 'center', gap: 14,
             padding: 16,
             backgroundColor: theme.surface,
             borderWidth: 1, borderColor: theme.borderStrong,
-            borderRadius: theme.radius,
-          }}>
+            borderRadius: theme.radiusLg,
+            boxShadow: theme.shadowInner,
+            transform: [{ scale: pressed ? 0.98 : 1 }],
+          })}>
           <View style={{
-            width: 44, height: 44, borderRadius: 6,
-            backgroundColor: theme.surface2,
-            borderWidth: 1, borderColor: theme.accent,
+            width: 44, height: 44, borderRadius: 12,
+            backgroundColor: theme.accentSoft,
             alignItems: 'center', justifyContent: 'center',
           }}>
             <Feather name="list" size={20} color={theme.accent} />
           </View>
           <View style={{ flex: 1, minWidth: 0 }}>
             <Text style={{
-              fontFamily: theme.fontDisplay,
+              fontFamily: theme.fontDisplaySemi,
               fontSize: 18, color: theme.text,
             }}>My Collection</Text>
             <Text style={{
@@ -216,7 +195,7 @@ export default function BindersList() {
               {collection.length} {collection.length === 1 ? 'card' : 'cards'}
             </Text>
           </View>
-          <Feather name="chevron-right" size={18} color={theme.textDim} />
+          <Feather name="chevron-right" size={18} color={theme.textMute} />
         </Pressable>
 
         {binders.length > 0 && (
@@ -228,33 +207,45 @@ export default function BindersList() {
         )}
 
         {isLoading && (
-          <Text style={{ color: theme.textDim }}>Loading…</Text>
+          <View style={{ gap: 10 }}>
+            <Skeleton height={78} radius={theme.radius} />
+            <Skeleton height={78} radius={theme.radius} />
+          </View>
         )}
 
         {!isLoading && binders.length === 0 && (
-          <Pressable
-            onPress={() => router.push('/binder/new')}
-            style={{
-              borderWidth: 1, borderColor: theme.borderStrong,
-              backgroundColor: theme.surface,
-              borderRadius: theme.radius, padding: 28,
-              alignItems: 'center',
+          <View style={{
+            borderWidth: 1, borderColor: theme.hairline, borderStyle: 'dashed',
+            backgroundColor: theme.glass,
+            borderRadius: theme.radiusLg, padding: 28,
+            alignItems: 'center',
+          }}>
+            <View style={{
+              width: 52, height: 52, borderRadius: theme.pill,
+              backgroundColor: theme.accentSoft,
+              alignItems: 'center', justifyContent: 'center',
             }}>
-            <Eyebrow>No binders yet</Eyebrow>
+              <Feather name="grid" size={20} color={theme.accent} />
+            </View>
             <Text style={{
-              color: theme.textDim, fontSize: 14, textAlign: 'center',
-              marginTop: 8, fontFamily: theme.fontDisplay, lineHeight: 22,
+              color: theme.text, fontSize: 19, textAlign: 'center',
+              marginTop: 14, fontFamily: theme.fontDisplaySemi,
             }}>
-              Start a binder to begin your collection.
+              No binders yet
             </Text>
             <Text style={{
-              color: theme.accent, fontSize: 12, marginTop: 10,
-              fontFamily: theme.fontUIBold, letterSpacing: 0.5,
-              textTransform: 'uppercase',
+              color: theme.textDim, fontSize: 13, textAlign: 'center',
+              marginTop: 6, fontFamily: theme.fontUI, lineHeight: 19,
             }}>
-              Create your first one →
+              Start a binder to give your cards a home.
             </Text>
-          </Pressable>
+            <Button
+              label="Create your first"
+              icon="arrow-right"
+              onPress={() => router.push('/binder/new')}
+              style={{ marginTop: 18 }}
+            />
+          </View>
         )}
       </View>
     </View>
@@ -275,7 +266,12 @@ export default function BindersList() {
         data={binders}
         keyExtractor={(b) => b.id}
         renderItem={renderItem}
+        style={{ flex: 1 }}
         ListHeaderComponent={Header}
+        stickyHeaderIndices={[0]}
+        // Gate pan activation behind a long-press so plain swipes stay with
+        // the native scroller; the handle's long-press uses the same 200ms.
+        panActivateAfterLongPress={200}
         contentContainerStyle={{ paddingHorizontal: 24, paddingBottom: 32 }}
         ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
         refreshControl={
@@ -311,7 +307,7 @@ export default function BindersList() {
         <Pressable
           onPress={closeMenu}
           style={{
-            flex: 1, backgroundColor: 'rgba(0,0,0,0.6)',
+            flex: 1, backgroundColor: theme.scrim,
             justifyContent: 'flex-end',
           }}
         >
@@ -320,11 +316,12 @@ export default function BindersList() {
             <SheetCard
               key={menuTarget ? menuTarget.id : 'closed'}
               style={{
-                marginHorizontal: 12, marginBottom: 12,
+                marginHorizontal: 12, marginBottom: 16,
                 backgroundColor: theme.surface,
-                borderWidth: 1, borderColor: theme.borderStrong,
-                borderRadius: theme.radius * 1.5,
+                borderWidth: 1, borderColor: theme.hairline,
+                borderRadius: theme.radiusXl,
                 padding: 8,
+                boxShadow: `${theme.shadowAmbient}, ${theme.shadowInner}`,
               }}
             >
               <View style={{ paddingHorizontal: 12, paddingTop: 8, paddingBottom: 12 }}>
@@ -339,6 +336,17 @@ export default function BindersList() {
                   if (t) openRename(t);
                 }}
               />
+              {!menuTarget?.is_bulk && (
+                <MenuAction
+                  icon="copy"
+                  label="Duplicate"
+                  onPress={() => {
+                    const t = menuTarget;
+                    closeMenu();
+                    if (t) onDuplicate(t);
+                  }}
+                />
+              )}
               {!menuTarget?.is_bulk && (
                 <MenuAction
                   icon="download"
@@ -374,7 +382,7 @@ export default function BindersList() {
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
           style={{
-            flex: 1, backgroundColor: 'rgba(0,0,0,0.6)',
+            flex: 1, backgroundColor: theme.scrim,
             justifyContent: 'center', alignItems: 'center', padding: 24,
           }}
         >
@@ -383,9 +391,10 @@ export default function BindersList() {
             style={{
               width: '100%', maxWidth: theme.maxContentW - 48,
               backgroundColor: theme.surface,
-              borderWidth: 1, borderColor: theme.borderStrong,
-              borderRadius: theme.radius * 1.5,
-              padding: 20,
+              borderWidth: 1, borderColor: theme.hairline,
+              borderRadius: theme.radiusXl,
+              padding: 24,
+              boxShadow: `${theme.shadowAmbient}, ${theme.shadowInner}`,
             }}
           >
             <Eyebrow>Rename binder</Eyebrow>
@@ -399,39 +408,17 @@ export default function BindersList() {
               onSubmitEditing={saveRename}
               returnKeyType="done"
               style={{
-                backgroundColor: theme.surface2,
-                borderWidth: 1, borderColor: theme.border,
+                backgroundColor: theme.glass,
+                borderWidth: 1, borderColor: theme.borderStrong,
                 borderRadius: theme.radius,
-                padding: 12, marginTop: 14,
-                fontSize: 15, color: theme.text,
+                paddingHorizontal: 16, paddingVertical: 13, marginTop: 16,
+                fontSize: 16, color: theme.text,
                 fontFamily: theme.fontDisplay,
               }}
             />
-            <View style={{ flexDirection: 'row', gap: 8, marginTop: 16 }}>
-              <Pressable
-                onPress={closeRename}
-                style={{
-                  flex: 1, padding: 12, borderRadius: theme.radius,
-                  borderWidth: 1, borderColor: theme.border,
-                  alignItems: 'center',
-                }}>
-                <Text style={{ color: theme.textDim, fontFamily: theme.fontUIBold, fontSize: 12, textTransform: 'uppercase' }}>
-                  Cancel
-                </Text>
-              </Pressable>
-              <Pressable
-                onPress={saveRename}
-                disabled={renameBinder.isPending}
-                style={{
-                  flex: 1, padding: 12, borderRadius: theme.radius,
-                  backgroundColor: theme.accent,
-                  alignItems: 'center',
-                  opacity: renameBinder.isPending ? 0.6 : 1,
-                }}>
-                <Text style={{ color: theme.accentText, fontFamily: theme.fontUIBold, fontSize: 12, textTransform: 'uppercase' }}>
-                  Save
-                </Text>
-              </Pressable>
+            <View style={{ flexDirection: 'row', gap: 10, marginTop: 20 }}>
+              <Button label="Cancel" variant="ghost" onPress={closeRename} style={{ flex: 1 }} />
+              <Button label="Save" onPress={saveRename} disabled={renameBinder.isPending} style={{ flex: 1 }} />
             </View>
           </SheetCard>
         </KeyboardAvoidingView>
@@ -448,25 +435,26 @@ function BinderRow({
   onPress: () => void;
   onOpenMenu: () => void;
 }) {
-  // ReorderableList provides the drag handle via a hook — call it once and
-  // expose the returned function to the handle below. The library owns the
-  // gesture; we only decide where to wire the trigger.
   const drag = useReorderableDrag();
   return (
     <Pressable
       onPress={onPress}
-      style={{
+      style={({ pressed }) => ({
         flexDirection: 'row', alignItems: 'center', gap: 10,
         padding: 16,
         backgroundColor: theme.surface,
         borderWidth: 1,
-        borderColor: binder.is_bulk ? theme.borderStrong : theme.border,
-        borderRadius: theme.radius,
+        borderColor: binder.is_bulk ? theme.borderStrong : theme.hairline,
+        borderRadius: theme.radiusLg,
         borderStyle: binder.is_bulk ? 'dashed' : 'solid',
-      }}>
+        boxShadow: theme.shadowInner,
+        transform: [{ scale: pressed ? 0.98 : 1 }],
+      })}>
       <Pressable
         onLongPress={drag}
-        delayLongPress={150}
+        // Matches panActivateAfterLongPress on the list, so the pan gesture
+        // is active by the time the drag starts.
+        delayLongPress={200}
         hitSlop={8}
         style={{
           paddingVertical: 6, paddingRight: 4, marginLeft: -4,
@@ -476,17 +464,18 @@ function BinderRow({
 
       {binder.is_bulk ? (
         <View style={{
-          width: 44, height: 44, borderRadius: 6,
-          backgroundColor: theme.surface2,
+          width: 44, height: 44, borderRadius: 12,
+          backgroundColor: theme.glass,
+          borderWidth: 1, borderColor: theme.hairline,
           alignItems: 'center', justifyContent: 'center',
         }}>
-          <Feather name="package" size={22} color={theme.accent} />
+          <Feather name="package" size={20} color={theme.accent} />
         </View>
       ) : (
         // mini grid icon
         <View style={{
-          width: 44, height: 44, borderRadius: 6,
-          backgroundColor: theme.surface2,
+          width: 44, height: 44, borderRadius: 12,
+          backgroundColor: theme.glass,
           borderWidth: 1, borderColor: theme.borderStrong,
           flexDirection: 'row', flexWrap: 'wrap', gap: 2,
           alignItems: 'center', justifyContent: 'center',
@@ -494,16 +483,16 @@ function BinderRow({
         }}>
           {Array.from({ length: Math.min(9, binder.grid_cols * binder.grid_rows) }).map((_, i) => (
             <View key={i} style={{
-              width: 8, height: 10, borderRadius: 1,
-              backgroundColor: theme.surface3,
+              width: 8, height: 10, borderRadius: 2,
+              backgroundColor: theme.accentSoft,
             }} />
           ))}
         </View>
       )}
 
       <View style={{ flex: 1, minWidth: 0 }}>
-        <Text style={{
-          fontFamily: theme.fontDisplay,
+        <Text numberOfLines={1} style={{
+          fontFamily: theme.fontDisplaySemi,
           fontSize: 18, color: theme.text,
         }}>{binder.name}</Text>
         <Text style={{
@@ -520,9 +509,14 @@ function BinderRow({
         onPress={onOpenMenu}
         hitSlop={10}
         accessibilityLabel={`Actions for ${binder.name}`}
-        style={{ padding: 4, marginRight: -4 }}
+        style={({ pressed }) => ({
+          width: 32, height: 32, borderRadius: theme.pill,
+          alignItems: 'center', justifyContent: 'center',
+          backgroundColor: pressed ? theme.glassStrong : theme.glass,
+          marginRight: -4,
+        })}
       >
-        <Feather name="more-horizontal" size={18} color={theme.textMute} />
+        <Feather name="settings" size={15} color={theme.textDim} />
       </Pressable>
     </Pressable>
   );

@@ -1,12 +1,4 @@
 // Single-binder view — paginated grid with optional page titles.
-//
-// Gestures (all live on the grid container):
-//   - Fling left/right → flip page.
-//   - Long-press (280 ms) then drag → drag-and-drop reorder.
-//       • Dragging near the right/left edge for ~500 ms flips to the
-//         next/previous page so you can move a card cross-page.
-//       • Drop on a slot → splice the card into that slot and renumber
-//         every position in the binder. Optimistic via useReorderCards.
 
 import { useState, useMemo, useRef, useEffect } from 'react';
 import {
@@ -26,6 +18,7 @@ import { Screen } from '@/components/Screen';
 import { Eyebrow } from '@/components/Eyebrow';
 import { clampToContent } from '@/lib/layout';
 import { Chip } from '@/components/Chip';
+import { IconDisc, Skeleton, Button } from '@/components/ui';
 import { CardSlot, EmptySlot } from '@/components/CardSlot';
 import {
   useBinder,
@@ -45,20 +38,21 @@ import {
   useMyProfile,
   useBinders,
   useMoveCards,
+  useCopyCards,
+  usePrefetchCard,
 } from '@/lib/queries';
 import { useToast } from '@/components/Toast';
 import { useConfirm } from '@/components/ConfirmDialog';
 import { SheetCard } from '@/components/SheetCard';
 import * as Clipboard from 'expo-clipboard';
 import { theme } from '@/lib/theme';
-import type { Status, CollectionRow, BinderPage, Binder } from '@/lib/types';
+import type { Status, CollectionRow, BinderPage, Binder, Visibility } from '@/lib/types';
 
 type Filter = 'all' | Status;
 
 const EDGE_FLIP_PX = 50;
 const EDGE_FLIP_DELAY_MS = 800;
-// Drag-to-page-browser hover thresholds. Reaching either of these mid-drag
-// triggers a state change without releasing the card.
+// Dwell times for drag-hover actions (open the page overlay, jump to a page).
 const PAGE_MENU_HOVER_MS = 600;
 const BLOB_HOVER_MS = 600;
 
@@ -81,55 +75,56 @@ export default function BinderView() {
   const { data: myProfile } = useMyProfile();
   const { data: allBinders = [] } = useBinders();
   const moveCards = useMoveCards();
+  const copyCards = useCopyCards();
   const ensurePages = useEnsureBinderPages();
+  const prefetchCard = usePrefetchCard();
   const toast = useToast();
   const confirm = useConfirm();
+  const insets = useSafeAreaInsets();
+  // Selection action sheet (Move / Copy / Delete) opened from the floating bar.
+  const [actionMenuOpen, setActionMenuOpen] = useState(false);
   const [filter, setFilter] = useState<Filter>('all');
+  const [filterSheetOpen, setFilterSheetOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
   const [pageIdx, setPageIdx] = useState(() => {
     const p = pageParam ? parseInt(pageParam, 10) : 0;
     return Number.isFinite(p) ? Math.max(0, p) : 0;
   });
   const [titleModalOpen, setTitleModalOpen] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
-  // Which page the rename modal applies to. Null means "the page that's
-  // currently visible in the binder" — set when the page-title pill is tapped.
+  // Rename modal target; null means the currently visible page.
   const [renameTargetPage, setRenameTargetPage] = useState<BinderPage | null>(null);
-  // Tap-on-card opens an action sheet. We keep the *id* (not the row) so
-  // the sheet picks up status changes from the cache as they happen.
+  // Card action sheet target. Stores the row id, not the row, so the sheet
+  // reflects status changes from the cache.
   const [actionRowId, setActionRowId] = useState<string | null>(null);
   const [pageMenuOpen, setPageMenuOpen] = useState(false);
-  // Selection mode: when active, tapping a card toggles it in this set
-  // instead of opening the action sheet, and drag is disabled.
+  // Selection mode: taps toggle membership in `selected`; drag is disabled.
   const [selecting, setSelecting] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [shareOpen, setShareOpen] = useState(false);
   // When non-empty, the move-target picker is shown for these row ids.
   const [moveRowIds, setMoveRowIds] = useState<string[]>([]);
-  // Default to list view for the bulk binder — its rows have no meaningful
-  // slot positions, so a 3×3 grid layout would just look broken.
+  const [copyRowIds, setCopyRowIds] = useState<string[]>([]);
+  // Bulk binders default to list view; their rows have no slot positions.
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid');
   useEffect(() => {
     if (binder?.is_bulk) setViewMode('list');
   }, [binder?.is_bulk]);
 
-  // Drag state — separated into refs (for stale-closure-free reads inside
-  // gesture callbacks) and React state (for re-render triggers).
+  // Drag state: refs mirror React state so gesture callbacks avoid stale
+  // closures; state triggers the re-renders.
   const [draggedAbsIdx, setDraggedAbsIdx] = useState<number | null>(null);
   const [hoverLocalIdx, setHoverLocalIdx] = useState<number | null>(null);
   const dragX = useSharedValue(0);
   const dragY = useSharedValue(0);
   const flipTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Page-flip animation. The whole "track" (current page + neighbors) slides
-  // as a single shared value. At idle, trackOffset = -pageIdx * gridW so the
-  // page at left=pageIdx*gridW lands centered. Adjacent pages are
-  // pre-rendered just off the visible area, so flips have no mount cost.
+  // Page-flip track: current page plus neighbors slide as one unit.
+  // At idle, trackOffset = -pageIdx * gridW.
   const trackOffset = useSharedValue(0);
   const isFlippingRef = useRef(false);
 
-  // Drag-to-page-browser state. While a card is being dragged, hovering
-  // over the "Page menu" button area for ~600ms opens an inline page
-  // overlay; from there, hovering a blob for ~600ms navigates the binder
-  // to that page with the dragged card still under the finger.
+  // Drag-to-page-browser: hovering the page-menu bar mid-drag opens an inline
+  // page overlay; hovering a blob there navigates with the drag still active.
   const [dragOverlayOpen, setDragOverlayOpen] = useState(false);
   const dragOverlayOpenRef = useRef(false);
   dragOverlayOpenRef.current = dragOverlayOpen;
@@ -139,9 +134,8 @@ export default function BinderView() {
   const blobHoverIdxRef = useRef<number | null>(null);
   blobHoverIdxRef.current = blobHoverIdx;
 
-  // Layout tracking for hit-testing inside the outer drag gesture.
-  // `gestureRoot` covers spread + page menu bar + pagination; coords inside
-  // onUpdate are relative to it.
+  // Layout for hit-testing in the drag gesture; onUpdate coords are relative
+  // to the gesture root (spread + page menu bar + pagination).
   const [spreadH, setSpreadH] = useState(0);
   const [pageMenuRect, setPageMenuRect] = useState({ y: 0, h: 0 });
   const [gestureRootH, setGestureRootH] = useState(0);
@@ -151,14 +145,12 @@ export default function BinderView() {
   pageMenuRectRef.current = pageMenuRect;
   const gestureRootHRef = useRef(0);
   gestureRootHRef.current = gestureRootH;
-  // Ref for overlayBlobH used inside the dragGesture closure (not in its
-  // useMemo deps). Without this, onUpdate reads a stale value from the
-  // first render — which is why maxScroll came out as 0 with 11 pages.
+  // overlayBlobH is read via ref inside the drag gesture (not a useMemo dep)
+  // so onUpdate sees the latest value, not the first-render one.
   const overlayBlobHRef = useRef(0);
 
-  // Drag-time overlay scroll. Driven by a Reanimated shared value so the
-  // transform on the blob list updates on the UI thread without triggering
-  // a JS re-render every tick.
+  // Drag-time overlay scroll; a shared value keeps the blob-list transform
+  // on the UI thread with no JS re-render per tick.
   const overlayScrollY = useSharedValue(0);
   const autoScrollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -166,28 +158,29 @@ export default function BinderView() {
     () => filter === 'all' ? rows : rows.filter((r) => r.status === filter),
     [filter, rows],
   );
+  // The grid dims filtered-out cards in place so slot occupancy stays honest;
+  // `filtered` only drives the list view and select-all.
+  const dimmedIds = useMemo(() => {
+    if (filter === 'all') return null;
+    return new Set(rows.filter((r) => r.status !== filter).map((r) => r.id));
+  }, [rows, filter]);
 
   const cols = binder?.grid_cols ?? 3;
   const rowsN = binder?.grid_rows ?? 3;
   const slotsPerPage = cols * rowsN;
-  // Cards live at fixed slot positions; "position" is a slot index, so
-  // page count is derived from the largest position in use, not from card
-  // count (gaps are allowed after a swap).
+  // "position" is a fixed slot index, so page count derives from the largest
+  // position in use, not card count (gaps are allowed). Uses all rows.
   const maxPos = useMemo(
-    () => filtered.reduce((m, r) => Math.max(m, r.position), -1),
-    [filtered],
+    () => rows.reduce((m, r) => Math.max(m, r.position), -1),
+    [rows],
   );
   const pageCount = Math.max(
     1, pages.length, Math.ceil((maxPos + 1) / slotsPerPage),
   );
   const current = Math.min(pageIdx, pageCount - 1);
 
-  // Self-heal: if `rows`'s max position implies more pages than `binder_pages`
-  // has rows for, backfill the missing rows. This catches binders mutated by
-  // older app versions (or any past bug) that left positions sparse without
-  // creating the matching page rows — symptom is a greyed "Page menu" pill
-  // and a phantom page that's visible in the grid but absent from the menu.
-  // Uses ALL rows (not the filter) so the heal isn't gated by chip state.
+  // Self-heal: backfill missing binder_pages rows when the max card position
+  // implies more pages than exist. Uses all rows, not the filtered set.
   const totalMaxPos = useMemo(
     () => rows.reduce((m, r) => Math.max(m, r.position), -1),
     [rows],
@@ -202,16 +195,16 @@ export default function BinderView() {
     }
   }, [binder, rows.length, pagesNeededTotal, pages.length, ensureIsPending, ensureMutate]);
 
-  // Lookup map: absolute position → card. Used to render slots and to
-  // detect what (if anything) lives at the drop target.
+  // Absolute position → card. Built from all rows so occupancy is unaffected
+  // by the filter.
   const cardByPos = useMemo(() => {
     const m = new Map<number, CollectionRow>();
-    for (const r of filtered) m.set(r.position, r);
+    for (const r of rows) m.set(r.position, r);
     return m;
-  }, [filtered]);
+  }, [rows]);
 
-  // The pager window. Renders the current page plus its immediate
-  // neighbors so a flip animation has nothing to mount.
+  // Pager window: current page plus immediate neighbors, pre-rendered so a
+  // flip has nothing to mount.
   const windowPages = useMemo(() => {
     const out: { p: number; slots: (CollectionRow | null)[] }[] = [];
     const lo = Math.max(0, pageIdx - 1);
@@ -239,21 +232,26 @@ export default function BinderView() {
   const hoverLocalIdxRef = useRef<number | null>(null);
   hoverLocalIdxRef.current = hoverLocalIdx;
 
-  // Layout numbers (need them before the gesture is built so callbacks can
-  // close over them). Clamped to theme.maxContentW so cards stay phone-sized
-  // on wide desktop browsers.
+  // Layout numbers, computed before the gesture so callbacks can close over
+  // them. Width clamps to theme.maxContentW on wide screens.
   const winW = clampToContent(Dimensions.get('window').width);
   const railPad = 20;
   const gap = 8;
   const innerW = winW - railPad * 2 - 12 - 6;
-  const cardW = (innerW - gap * (cols - 1)) / cols;
+  // Card size from width, clamped to the measured spread height; RN doesn't
+  // clip overflow, so an unclamped tall grid paints over its neighbours.
+  const cardWFromWidth = (innerW - gap * (cols - 1)) / cols;
+  const cardHBudget = spreadH > 0
+    ? (spreadH - 8 - gap * (rowsN - 1)) / rowsN
+    : Infinity;
+  const cardW = Math.min(cardWFromWidth, cardHBudget / 1.4);
   const cardH = cardW * 1.4;
   const gridW = cols * cardW + (cols - 1) * gap;
   const gridH = rowsN * cardH + (rowsN - 1) * gap;
-  // Grid's x in gesture-root coordinates is constant: spread paddingHorizontal
-  // (railPad) + rail width (12) + paddingLeft (6). Grid's y depends on
-  // spread height — captured via onLayout and read through spreadHRef.
-  const gridXInRoot = railPad + 12 + 6;
+  // Grid x in gesture-root coords: rail padding + centering offset + rail
+  // width + inner padding. Grid y comes from the measured spread height.
+  const gridXInRoot =
+    railPad + Math.max(0, (winW - railPad * 2 - (12 + 6 + gridW)) / 2) + 12 + 6;
 
   // Drag-overlay blob grid layout (mirrors PageBrowserModal but laid out
   // in the gesture root so onUpdate can hit-test against it).
@@ -272,9 +270,8 @@ export default function BinderView() {
   const overlayBlobH = OVERLAY_HDR_H + OVERLAY_HDR_GAP + OVERLAY_BLOB_PAD * 2 + overlayMiniGridH;
   overlayBlobHRef.current = overlayBlobH;
 
-  // Map a gesture-root point to a blob index, or null if outside the grid.
-  // Accounts for the overlay's current scroll offset so blobs match what
-  // the user sees, not where they started.
+  // Maps a gesture-root point to a blob index (null if outside), accounting
+  // for the overlay's current scroll offset.
   const blobAtRootPoint = (x: number, y: number): number | null => {
     const cx = x - OVERLAY_SIDE_PAD;
     const cy = y - OVERLAY_TOP_PAD + overlayScrollY.value;
@@ -348,9 +345,8 @@ export default function BinderView() {
     }, 16);
   };
 
-  // User-initiated page flip: haptic + slide of the whole pager track.
-  // Adjacent pages are already mounted, so the only thing that changes is
-  // the track's translateX — no React commit happens mid-animation.
+  // Page flip: slides the pager track. Adjacent pages are already mounted,
+  // so no React commit happens mid-animation.
   const clearFlipping = () => { isFlippingRef.current = false; };
   const flipPage = (dir: 1 | -1) => {
     const cur = currentRef.current;
@@ -461,20 +457,16 @@ export default function BinderView() {
           // Don't drop on slots while overlay is up.
           if (hoverLocalIdxRef.current !== null) setHoverLocalIdx(null);
 
-          // Compute the auto-scroll envelope from the total content size.
-          // Read pageCount + overlayBlobH from refs so we get the LATEST
-          // values, not whatever the gesture's useMemo closure captured on
-          // first mount.
+          // Auto-scroll envelope from the total content size. pageCount and
+          // overlayBlobH come from refs to avoid stale closure values.
           const liveBlobH = overlayBlobHRef.current;
           const liveCount = pageCountRef.current;
           const rowCount = Math.ceil(liveCount / 2);
           const totalContentH = rowCount * liveBlobH + Math.max(0, rowCount - 1) * OVERLAY_BLOB_GAP;
           const viewportH = Math.max(0, gestureRootHRef.current - OVERLAY_TOP_PAD - 12);
           const maxScroll = Math.max(0, totalContentH - viewportH);
-          // Generous band at the very top/bottom edges of the overlay.
-          // canScrollUp/Down keep the zones out of the way at the limits.
-          // 120 px gives a clear, easy-to-hit target without eating most of
-          // the overlay; was 70 px which was hard to find blind during a drag.
+          // Edge bands for auto-scroll; canScrollUp/Down disable them at the
+          // scroll limits.
           const AUTOSCROLL_ZONE = 120;
           const cur = overlayScrollY.value;
           const canScrollDown = cur < maxScroll - 0.5;
@@ -483,10 +475,8 @@ export default function BinderView() {
           const inBottomZone = canScrollDown && e.y > gestureRootHRef.current - AUTOSCROLL_ZONE;
 
           if (inTopZone || inBottomZone) {
-            // Auto-scroll takes priority over navigation. While the finger
-            // is parked in the edge band, we just scroll — no blob nav fires.
-            // Speed scales with how deep into the edge band the finger is, so
-            // the user can ease in/out instead of all-or-nothing.
+            // Auto-scroll takes priority over blob navigation; speed scales
+            // with depth into the edge band.
             const depth = inBottomZone
               ? Math.min(1, (e.y - (gestureRootHRef.current - AUTOSCROLL_ZONE)) / AUTOSCROLL_ZONE)
               : Math.min(1, ((OVERLAY_TOP_PAD + AUTOSCROLL_ZONE) - e.y) / AUTOSCROLL_ZONE);
@@ -517,7 +507,7 @@ export default function BinderView() {
         // Outside overlay zone: stop any auto-scroll still running.
         stopAutoScroll();
 
-        // GRID ZONE: existing in-grid drag-and-drop targeting.
+        // GRID ZONE: in-grid drag-and-drop targeting.
         const gridY = (spreadHRef.current - gridH) / 2;
         const lx = e.x - gridXInRoot;
         const ly = e.y - gridY;
@@ -525,9 +515,8 @@ export default function BinderView() {
         const local = inGrid ? pointToSlot(lx, ly) : null;
         if (local !== hoverLocalIdxRef.current) setHoverLocalIdx(local);
 
-        // Edge-flip fires whenever the finger is near the left/right edge
-        // band AND roughly within the grid's vertical range — even if the
-        // finger has drifted a bit past the grid bounds horizontally.
+        // Edge-flip fires near the left/right edge band while roughly within
+        // the grid's vertical range, even past the grid bounds horizontally.
         const EDGE_FLIP_VPAD = 60;
         const nearGridY = ly >= -EDGE_FLIP_VPAD && ly <= gridH + EDGE_FLIP_VPAD;
         if (nearGridY && lx > gridW - EDGE_FLIP_PX && currentRef.current < pageCountRef.current - 1) {
@@ -557,7 +546,7 @@ export default function BinderView() {
       .onEnd(() => {
         const drag = draggedAbsIdxRef.current;
         const hover = hoverLocalIdxRef.current;
-        // Drop ONLY if user released over a grid slot AND the overlay isn't up.
+        // Drop only when released over a grid slot with the overlay closed.
         if (!dragOverlayOpenRef.current && drag !== null && hover !== null) {
           handleDrop(drag, hover, currentRef.current);
         }
@@ -581,12 +570,11 @@ export default function BinderView() {
         cancelBlobHover();
         stopAutoScroll();
       });
-    // closures via refs — no deps
+    // callbacks read live values via refs
   }, [cardW, cardH, gridW, gridH, slotsPerPage]);
 
-  // The drag gesture lives on the outer container (spread + page menu +
-  // pagination) so the dragged card can survive transitions into the
-  // drag-time overlay. Swipe stays scoped to the grid view.
+  // Drag lives on the outer container so the dragged card survives the
+  // drag-time overlay; swipe stays scoped to the grid view.
   const outerGesture = useMemo(
     () => selecting ? Gesture.Tap().enabled(false) : dragGesture,
     [dragGesture, selecting],
@@ -611,8 +599,17 @@ export default function BinderView() {
 
   if (loadingBinder || !binder) {
     return (
-      <Screen style={{ alignItems: 'center', justifyContent: 'center' }}>
-        <ActivityIndicator color={theme.accent} />
+      <Screen edges={['top', 'left', 'right']}>
+        <View style={{ paddingHorizontal: 24, paddingTop: 14, gap: 10 }}>
+          <Skeleton width={120} height={10} radius={5} />
+          <Skeleton width={200} height={24} radius={9} />
+          <View style={{ flexDirection: 'row', gap: 8, marginTop: 6 }}>
+            <Skeleton width={64} height={34} radius={999} />
+            <Skeleton width={64} height={34} radius={999} />
+            <Skeleton width={64} height={34} radius={999} />
+          </View>
+          <Skeleton height={360} radius={theme.radiusLg} style={{ marginTop: 18 }} />
+        </View>
       </Screen>
     );
   }
@@ -649,16 +646,13 @@ export default function BinderView() {
     setRenameTargetPage(null);
   };
   const onAddPage = () => {
-    // Insert directly after the page the user is viewing rather than at the
-    // tail. The new page lands at index `current + 1`; reorder_binder_page
-    // shifts everything from `current + 1` onward down by one (including
-    // card positions), so the new page is the one we should jump to.
+    // Inserts after the current page. reorder_binder_page shifts everything
+    // from current + 1 onward (card positions included), so jump to current + 1.
     addPage.mutate({ binderId: binder.id, afterIndex: current });
     jumpToPage(current + 1);
   };
-  // Delete-current-page is shared between the header trash icon and the
-  // page-browser action sheet. Same safety checks apply in both places:
-  // last page is undeletable, non-empty pages refuse to delete.
+  // Shared by the header trash icon and the page-browser sheet. The last page
+  // and non-empty pages refuse to delete.
   const onDeletePage = async (page: BinderPage) => {
     if (pageCount <= 1) {
       toast.error('A binder needs at least one page.');
@@ -688,147 +682,76 @@ export default function BinderView() {
     if (currentPage) onDeletePage(currentPage);
   };
 
+  const allSelectedInView =
+    filtered.length > 0 && filtered.every((r) => selected.has(r.id));
+  const onToggleAll = () => {
+    if (allSelectedInView) setSelected(new Set());
+    else setSelected(new Set(filtered.map((r) => r.id)));
+  };
+  const onCancelSelect = () => { setSelecting(false); setSelected(new Set()); };
+  const onBulkMove = () => {
+    if (selected.size === 0) return;
+    setActionMenuOpen(false);
+    setMoveRowIds(Array.from(selected));
+  };
+  const onBulkCopy = () => {
+    if (selected.size === 0) return;
+    setActionMenuOpen(false);
+    setCopyRowIds(Array.from(selected));
+  };
+  const onBulkDelete = async () => {
+    if (selected.size === 0) return;
+    setActionMenuOpen(false);
+    const ids = Array.from(selected);
+    const ok = await confirm({
+      title: `Remove ${ids.length} ${ids.length === 1 ? 'card' : 'cards'}?`,
+      message: 'This deletes the selected cards from this binder.',
+      confirmText: 'Remove',
+      destructive: true,
+    });
+    if (!ok) return;
+    await removeCards.mutateAsync(ids);
+    setSelected(new Set());
+    setSelecting(false);
+  };
+
   return (
     <Screen edges={['top', 'left', 'right']}>
-      {selecting ? (
-        <View style={{
-          flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-          paddingHorizontal: 14, paddingTop: 6, paddingBottom: 2, gap: 8,
-        }}>
-          <Pressable onPress={() => { setSelecting(false); setSelected(new Set()); }} hitSlop={12}>
-            <Text style={{
-              color: theme.textDim, fontFamily: theme.fontUIBold,
-              fontSize: 13, letterSpacing: 0.5, textTransform: 'uppercase',
-            }}>Cancel</Text>
-          </Pressable>
-          <Text style={{
-            color: theme.text, fontFamily: theme.fontMono, fontSize: 12,
-            letterSpacing: 1.5, textTransform: 'uppercase',
-          }}>{selected.size} selected</Text>
-          <View style={{ flexDirection: 'row', gap: 14 }}>
-          {(() => {
-            const allSelected = filtered.length > 0 && filtered.every((r) => selected.has(r.id));
-            return (
-              <Pressable
-                onPress={() => {
-                  if (allSelected) setSelected(new Set());
-                  else setSelected(new Set(filtered.map((r) => r.id)));
-                }}
-                disabled={filtered.length === 0}
-                hitSlop={12}>
-                <Text style={{
-                  color: filtered.length === 0 ? theme.textMute : theme.accent,
-                  fontFamily: theme.fontUIBold,
-                  fontSize: 13, letterSpacing: 0.5, textTransform: 'uppercase',
-                }}>{allSelected ? 'None' : 'All'}</Text>
-              </Pressable>
-            );
-          })()}
-          <Pressable
-            onPress={() => {
-              if (selected.size === 0) return;
-              setMoveRowIds(Array.from(selected));
-            }}
-            disabled={selected.size === 0}
-            hitSlop={12}
-          >
-            <Text style={{
-              color: selected.size === 0 ? theme.textMute : theme.accent,
-              fontFamily: theme.fontUIBold,
-              fontSize: 13, letterSpacing: 0.5, textTransform: 'uppercase',
-            }}>Move</Text>
-          </Pressable>
-          <Pressable
-            onPress={async () => {
-              if (selected.size === 0) return;
-              const ids = Array.from(selected);
-              const ok = await confirm({
-                title: `Remove ${ids.length} ${ids.length === 1 ? 'card' : 'cards'}?`,
-                message: 'This deletes the selected cards from this binder.',
-                confirmText: 'Remove',
-                destructive: true,
-              });
-              if (!ok) return;
-              await removeCards.mutateAsync(ids);
-              setSelected(new Set());
-              setSelecting(false);
-            }}
-            disabled={selected.size === 0}
-            hitSlop={12}
-          >
-            <Text style={{
-              color: selected.size === 0 ? theme.textMute : theme.statusReally,
-              fontFamily: theme.fontUIBold,
-              fontSize: 13, letterSpacing: 0.5, textTransform: 'uppercase',
-            }}>Delete</Text>
-          </Pressable>
-          </View>
-        </View>
-      ) : (
-        <View style={{
-          flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-          paddingHorizontal: 14, paddingTop: 6, paddingBottom: 2,
-        }}>
-          <Pressable
+      <View style={{
+        flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+        paddingHorizontal: 14, paddingTop: 6, paddingBottom: 2,
+      }}>
+          <IconDisc
+            name="chevron-left"
+            size={36}
             onPress={() => router.navigate('/binder')}
-            hitSlop={12}
-            accessibilityLabel="Back to all binders">
-            <Feather name="arrow-left" size={22} color={theme.textDim} />
-          </Pressable>
-          <View style={{ flexDirection: 'row', gap: 18 }}>
-            <Pressable onPress={() => setViewMode((m) => (m === 'grid' ? 'list' : 'grid'))} hitSlop={12}>
-              <Feather name={viewMode === 'grid' ? 'list' : 'grid'} size={18} color={theme.textDim} />
-            </Pressable>
-            <Pressable onPress={() => setShareOpen(true)} hitSlop={12}>
-              <Feather
-                name={binder?.visibility === 'public' ? 'globe' : binder?.visibility === 'unlisted' ? 'link' : 'lock'}
-                size={18}
-                color={binder?.visibility !== 'private' ? theme.accent : theme.textDim}
-              />
-            </Pressable>
-            <Pressable onPress={() => setSelecting(true)} hitSlop={12}>
-              <Feather name="check-square" size={18} color={theme.textDim} />
-            </Pressable>
-            <Pressable
-              onPress={onDeleteCurrentPage}
-              hitSlop={12}
-              accessibilityLabel="Delete this page"
-            >
-              <Feather name="trash-2" size={18} color={theme.textDim} />
-            </Pressable>
+          />
+          <View style={{ flexDirection: 'row', gap: 8 }}>
+            <IconDisc
+              name="filter"
+              size={36}
+              iconSize={14}
+              active={filter !== 'all'}
+              onPress={() => setFilterSheetOpen(true)}
+            />
+            <IconDisc name="check-square" size={36} iconSize={14} onPress={() => setSelecting(true)} />
+            <IconDisc name="more-horizontal" size={36} onPress={() => setMoreOpen(true)} />
           </View>
-        </View>
-      )}
+      </View>
 
-      <View style={{ paddingHorizontal: 24, paddingTop: 4 }}>
+      <View style={{ paddingHorizontal: 24, paddingTop: 8 }}>
         <Eyebrow>{cols}×{rowsN} · {rows.length} {rows.length === 1 ? 'card' : 'cards'}</Eyebrow>
-        <Text style={{
-          fontFamily: theme.fontDisplay,
+        <Text numberOfLines={1} style={{
+          fontFamily: theme.fontDisplaySemi,
           fontSize: 26, color: theme.text, marginTop: 4, lineHeight: 34,
         }}>{binder.name}</Text>
       </View>
 
-      <View style={{
-        flexDirection: 'row', flexWrap: 'wrap', gap: 6,
-        paddingHorizontal: 24, paddingVertical: 10,
-      }}>
-        {/* Filter chips no longer jump to page 0 — the page count derives
-            from the highest filtered position, so pageIdx clamps itself if
-            the new filter has fewer pages than the current page. Letting the
-            user stay on their current page is less surprising. */}
-        <Chip label="All"    active={filter === 'all'}    onPress={() => setFilter('all')} />
-        <Chip label="Have"   active={filter === 'have'}   color={theme.statusHave}   onPress={() => setFilter('have')} />
-        <Chip label="Want"   active={filter === 'want'}   color={theme.statusWant}   onPress={() => setFilter('want')} />
-        <Chip label="Need" active={filter === 'really'} color={theme.statusReally} onPress={() => setFilter('really')} />
-      </View>
-
       {viewMode === 'grid' ? <>
-      {/* Reserve a fixed slot for the page title + total so titled vs
-          untitled pages don't shift the grid vertically. Height needs to
-          accommodate Cormorant's descenders (g/y/p) at 22pt + a few px of
-          breathing room — 32 used to clip the bottoms. */}
+      {/* Fixed-height title row so titled vs untitled pages don't shift the
+          grid; height accommodates Cormorant's descenders at 22pt. */}
       <View style={{
-        paddingHorizontal: 24, paddingBottom: 6, height: 40,
+        paddingHorizontal: 24, paddingTop: 8, paddingBottom: 6, height: 48,
         flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12,
       }}>
         <Pressable
@@ -869,7 +792,7 @@ export default function BinderView() {
         style={{ flex: 1, paddingHorizontal: railPad, justifyContent: 'center' }}
         onLayout={(e) => setSpreadH(e.nativeEvent.layout.height)}
       >
-        <View style={{ flexDirection: 'row' }}>
+        <View style={{ flexDirection: 'row', justifyContent: 'center' }}>
           <View style={{ width: 12, justifyContent: 'space-around', alignItems: 'center', paddingVertical: 4 }}>
             {Array.from({ length: rowsN + 1 }).map((_, i) => (
               <View key={i} style={{
@@ -904,6 +827,7 @@ export default function BinderView() {
                       }}>
                         {slots.map((r, i) => {
                           const pos = slotPos(i);
+                          const isDimmed = !!(r && dimmedIds?.has(r.id));
                           if (!isCurrent) {
                             // Off-screen neighbor: visual only.
                             return (
@@ -911,6 +835,7 @@ export default function BinderView() {
                                 position: 'absolute',
                                 left: pos.left, top: pos.top,
                                 width: cardW, height: cardH,
+                                opacity: isDimmed ? 0.18 : 1,
                               }}>
                                 {r ? <CardSlot row={r} width={cardW} /> : null}
                               </View>
@@ -924,7 +849,8 @@ export default function BinderView() {
                               position: 'absolute',
                               left: pos.left, top: pos.top,
                               width: cardW, height: cardH,
-                              opacity: isDragged ? 0.25 : 1,
+                              // Filtered-out cards stay in their slots, dimmed.
+                              opacity: isDragged ? 0.25 : isDimmed ? 0.18 : 1,
                             }}>
                               {r ? (
                                 <CardSlot
@@ -939,6 +865,9 @@ export default function BinderView() {
                                         return next;
                                       });
                                     } else {
+                                      // Warm the detail cache so "Info"
+                                      // opens on a ready screen.
+                                      prefetchCard(r.card_id);
                                       setActionRowId(r.id);
                                     }
                                   }}
@@ -1021,7 +950,7 @@ export default function BinderView() {
 
       <View style={{
         flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-        padding: 18,
+        paddingHorizontal: 18, paddingVertical: 10,
       }}>
         <ArrowBtn dir="left"  disabled={current === 0}              onPress={() => flipPage(-1)} />
         <Text style={{
@@ -1033,9 +962,8 @@ export default function BinderView() {
         <ArrowBtn dir="right" disabled={current >= pageCount - 1} onPress={() => flipPage(1)} />
       </View>
 
-      {/* Drag-time page browser overlay. Mounts inside the gesture root so
-          the Pan gesture survives showing/hiding it. ScrollView is auto-
-          driven by the parent gesture (finger near top/bottom edge). */}
+      {/* Drag-time page browser overlay. Mounted inside the gesture root so
+          the Pan gesture survives showing/hiding it. */}
       {dragOverlayOpen && (() => {
         const rowCount = Math.ceil(pageCount / 2);
         const totalContentH = rowCount * overlayBlobH + Math.max(0, rowCount - 1) * OVERLAY_BLOB_GAP;
@@ -1057,8 +985,8 @@ export default function BinderView() {
               Hover a page to jump{canScrollMore ? ' · drag to edges to scroll' : ''}
             </Text>
 
-            {/* Edge affordances — only visible when content overflows, so they
-                advertise the auto-scroll bands without cluttering small lists. */}
+            {/* Chevrons marking the auto-scroll bands; shown only when content
+                overflows. */}
             {canScrollMore && (
               <>
                 <View style={{
@@ -1140,8 +1068,8 @@ export default function BinderView() {
         );
       })()}
 
-      {/* Dragged card overlay — sits at the gesture root so it can travel
-          anywhere on screen (across the grid AND the drag-time overlay). */}
+      {/* Dragged card overlay; sits at the gesture root so it can travel
+          across both the grid and the drag-time overlay. */}
       {draggedRow && (
         <Animated.View
           pointerEvents="none"
@@ -1165,7 +1093,7 @@ export default function BinderView() {
       </GestureDetector>
       </> : (
         <BinderListCards
-          rows={rows}
+          rows={filtered}
           selecting={selecting}
           selected={selected}
           onTap={(r) => {
@@ -1176,6 +1104,7 @@ export default function BinderView() {
                 return next;
               });
             } else {
+              prefetchCard(r.card_id);
               router.push(`/card/${r.card_id}?row=${r.id}`);
             }
           }}
@@ -1200,12 +1129,8 @@ export default function BinderView() {
         onSelectPage={(idx) => { jumpToPage(idx); setPageMenuOpen(false); }}
         onReorderPage={async (page, toIdx) => {
           const src = page.page_index;
-          // Adjacent-forward (drag n onto n+1) is the one case where
-          // "insert in front of target" collapses to a no-op (newIndex
-          // would equal src). Special-case it to a swap so the gesture
-          // produces the obvious result: the two pages exchange. Adjacent-
-          // backward (n+1 onto n) already swaps as a natural side effect
-          // of the splice insertion.
+          // Adjacent-forward (n onto n+1) would collapse to a no-op under
+          // insert-in-front semantics, so special-case it to a swap.
           if (src + 1 === toIdx) {
             const newCurr =
               current === src ? toIdx :
@@ -1219,16 +1144,11 @@ export default function BinderView() {
             if (newCurr !== current) jumpToPage(newCurr);
             return;
           }
-          // "Insert in front of target" semantics: dropping on slot N
-          // means the dragged page lands IMMEDIATELY BEFORE the page that
-          // was at N. The SQL reorder_binder_page is splice-insertion, so
-          // for a downward drag (src < toIdx) the dragged page lands at the
-          // newIndex we pass; passing toIdx-1 makes it stop one slot
-          // earlier — right in front of the target.
+          // Insert-in-front semantics: reorder_binder_page splice-inserts, so
+          // a downward drag passes toIdx - 1 to land just before the target.
           const newIndex = src < toIdx ? toIdx - 1 : toIdx;
           if (newIndex === src) return;
-          // Predict where the previously-viewed page lands so the binder
-          // keeps following the user's actual content (not a fixed index).
+          // Predict where the viewed page lands so the binder keeps following it.
           let newCurr = current;
           if (current === src) newCurr = newIndex;
           else if (src < newIndex && current > src && current <= newIndex) newCurr = current - 1;
@@ -1237,19 +1157,6 @@ export default function BinderView() {
             binderId: binder.id, pageId: page.id, newIndex,
           });
           if (newCurr !== current) jumpToPage(newCurr);
-        }}
-        onMovePage={(page, dir) => {
-          const other = dir === 'left' ? page.page_index - 1 : page.page_index + 1;
-          if (other < 0 || other >= pageCount) return;
-          swapPages.mutate({
-            binderId: binder.id,
-            idxA: page.page_index,
-            idxB: other,
-          });
-          // Keep the viewer on the same content: if the moved or swapped
-          // page was the currently-visible one, follow it to its new index.
-          if (current === page.page_index) jumpToPage(other);
-          else if (current === other) jumpToPage(page.page_index);
         }}
         onRenamePage={(page) => {
           setPageMenuOpen(false);
@@ -1260,7 +1167,7 @@ export default function BinderView() {
       />
 
       <CardActionSheet
-        row={actionRowId ? filtered.find((r) => r.id === actionRowId) ?? null : null}
+        row={actionRowId ? rows.find((r) => r.id === actionRowId) ?? null : null}
         onClose={() => setActionRowId(null)}
         onInfo={(row) => {
           setActionRowId(null);
@@ -1292,21 +1199,22 @@ export default function BinderView() {
       >
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-          style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', alignItems: 'center', padding: 24 }}
+          style={{ flex: 1, backgroundColor: theme.scrim, justifyContent: 'center', alignItems: 'center', padding: 24 }}
         >
           <SheetCard
             key={titleModalOpen ? 'open' : 'closed'}
             style={{
               width: '100%', maxWidth: theme.maxContentW - 48,
               backgroundColor: theme.surface,
-              borderWidth: 1, borderColor: theme.borderStrong,
-              borderRadius: theme.radius * 1.5,
-              padding: 20,
+              borderWidth: 1, borderColor: theme.hairline,
+              borderRadius: theme.radiusXl,
+              padding: 24,
+              boxShadow: `${theme.shadowAmbient}, ${theme.shadowInner}`,
             }}
           >
             <Eyebrow>Page title</Eyebrow>
-            <Text style={{ color: theme.textDim, fontSize: 12, marginTop: 4 }}>
-              Optional — leave blank to clear.
+            <Text style={{ color: theme.textDim, fontSize: 12, fontFamily: theme.fontUI, marginTop: 6 }}>
+              Optional. Leave blank to clear.
             </Text>
             <TextInput
               value={titleDraft}
@@ -1315,37 +1223,17 @@ export default function BinderView() {
               placeholderTextColor={theme.textMute}
               autoFocus
               style={{
-                backgroundColor: theme.surface2,
-                borderWidth: 1, borderColor: theme.border,
+                backgroundColor: theme.glass,
+                borderWidth: 1, borderColor: theme.borderStrong,
                 borderRadius: theme.radius,
-                padding: 12, marginTop: 14,
+                paddingHorizontal: 16, paddingVertical: 13, marginTop: 16,
                 fontSize: 15, color: theme.text,
                 fontFamily: theme.fontUI,
               }}
             />
-            <View style={{ flexDirection: 'row', gap: 8, marginTop: 16 }}>
-              <Pressable
-                onPress={() => setTitleModalOpen(false)}
-                style={{
-                  flex: 1, padding: 12, borderRadius: theme.radius,
-                  borderWidth: 1, borderColor: theme.border,
-                  alignItems: 'center',
-                }}>
-                <Text style={{ color: theme.textDim, fontFamily: theme.fontUIBold, fontSize: 12, textTransform: 'uppercase' }}>
-                  Cancel
-                </Text>
-              </Pressable>
-              <Pressable
-                onPress={saveTitle}
-                style={{
-                  flex: 1, padding: 12, borderRadius: theme.radius,
-                  backgroundColor: theme.accent,
-                  alignItems: 'center',
-                }}>
-                <Text style={{ color: theme.accentText, fontFamily: theme.fontUIBold, fontSize: 12, textTransform: 'uppercase' }}>
-                  Save
-                </Text>
-              </Pressable>
+            <View style={{ flexDirection: 'row', gap: 10, marginTop: 20 }}>
+              <Button label="Cancel" variant="ghost" onPress={() => setTitleModalOpen(false)} style={{ flex: 1 }} />
+              <Button label="Save" onPress={saveTitle} style={{ flex: 1 }} />
             </View>
           </SheetCard>
         </KeyboardAvoidingView>
@@ -1370,7 +1258,185 @@ export default function BinderView() {
         }}
       />
 
-      <MoveTargetSheet
+      <FilterSheet
+        open={filterSheetOpen}
+        filter={filter}
+        rows={rows}
+        onClose={() => setFilterSheetOpen(false)}
+        onPick={(f) => {
+          setFilter(f);
+          setFilterSheetOpen(false);
+        }}
+      />
+
+      <Modal
+        visible={moreOpen}
+        transparent
+        animationType="none"
+        onRequestClose={() => setMoreOpen(false)}
+      >
+        <Pressable
+          onPress={() => setMoreOpen(false)}
+          style={{ flex: 1, backgroundColor: theme.scrim, justifyContent: 'flex-end' }}
+        >
+          <Pressable onPress={() => {}}>
+            <SheetCard style={{
+              marginHorizontal: 12, marginBottom: 16 + insets.bottom,
+              backgroundColor: theme.surface,
+              borderWidth: 1, borderColor: theme.hairline,
+              borderRadius: theme.radiusXl,
+              padding: 8,
+              boxShadow: `${theme.shadowAmbient}, ${theme.shadowInner}`,
+            }}>
+              <View style={{ paddingHorizontal: 12, paddingTop: 8, paddingBottom: 12 }}>
+                <Eyebrow>{binder.name}</Eyebrow>
+              </View>
+              <SelectionAction
+                icon="zap"
+                label="Page ideas"
+                onPress={() => {
+                  setMoreOpen(false);
+                  router.push(`/binder/ideas?binder=${id}`);
+                }}
+              />
+              <SelectionAction
+                icon={viewMode === 'grid' ? 'list' : 'grid'}
+                label={viewMode === 'grid' ? 'Switch to list view' : 'Switch to grid view'}
+                onPress={() => {
+                  setMoreOpen(false);
+                  setViewMode((m) => (m === 'grid' ? 'list' : 'grid'));
+                }}
+              />
+              <SelectionAction
+                icon={binder.visibility === 'public' ? 'globe' : binder.visibility === 'friends' ? 'users' : 'lock'}
+                label="Share & visibility"
+                onPress={() => {
+                  setMoreOpen(false);
+                  setShareOpen(true);
+                }}
+              />
+              <SelectionAction
+                icon="trash-2"
+                label="Delete this page"
+                destructive
+                onPress={() => {
+                  setMoreOpen(false);
+                  onDeleteCurrentPage();
+                }}
+              />
+            </SheetCard>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* Floating selection bar; sits above the tab bar with safe-area
+          padding. */}
+      {selecting && (
+        <View
+          pointerEvents="box-none"
+          style={{
+            position: 'absolute', left: 0, right: 0,
+            bottom: insets.bottom + 12,
+            alignItems: 'center',
+          }}>
+          <View style={{
+            flexDirection: 'row', alignItems: 'center', gap: 16,
+            paddingLeft: 18, paddingRight: 10, paddingVertical: 10,
+            backgroundColor: 'rgba(26,21,17,0.98)',
+            borderWidth: 1, borderColor: theme.border,
+            borderRadius: theme.pill,
+            boxShadow: `${theme.shadowAmbient}, ${theme.shadowInner}`,
+          }}>
+            <Pressable onPress={onCancelSelect} hitSlop={10}>
+              <Text style={{
+                color: theme.textDim, fontFamily: theme.fontUIBold,
+                fontSize: 13, letterSpacing: 0.5, textTransform: 'uppercase',
+              }}>Cancel</Text>
+            </Pressable>
+            <View style={{ width: 1, height: 18, backgroundColor: theme.border }} />
+            {/* Single Text run so the count digit shares the label's baseline;
+                mixing fontMono inline with fontUI misaligns it vertically. */}
+            <Text style={{
+              color: theme.text, fontFamily: theme.fontUI, fontSize: 14,
+            }}>
+              <Text style={{ fontFamily: theme.fontUIBold, color: theme.accent }}>
+                {selected.size}
+              </Text>
+              {selected.size === 1 ? '  card selected' : '  cards selected'}
+            </Text>
+            <Pressable
+              onPress={onToggleAll}
+              disabled={filtered.length === 0}
+              hitSlop={12}
+              accessibilityLabel={allSelectedInView ? 'Deselect all' : 'Select all'}
+              style={{ padding: 2 }}
+            >
+              <Feather
+                name={allSelectedInView ? 'check-square' : 'square'}
+                size={18}
+                color={
+                  filtered.length === 0
+                    ? theme.textMute
+                    : allSelectedInView ? theme.accent : theme.textDim
+                }
+              />
+            </Pressable>
+            <Pressable
+              onPress={() => selected.size > 0 && setActionMenuOpen(true)}
+              disabled={selected.size === 0}
+              hitSlop={10}
+              accessibilityLabel="More actions"
+              style={{
+                width: 38, height: 38, borderRadius: 19,
+                alignItems: 'center', justifyContent: 'center',
+                backgroundColor: selected.size === 0 ? theme.surface2 : theme.accent,
+              }}
+            >
+              <Feather
+                name="more-horizontal"
+                size={18}
+                color={selected.size === 0 ? theme.textMute : theme.accentText}
+              />
+            </Pressable>
+          </View>
+        </View>
+      )}
+
+      <Modal
+        visible={actionMenuOpen}
+        transparent
+        animationType="none"
+        onRequestClose={() => setActionMenuOpen(false)}
+      >
+        <Pressable
+          onPress={() => setActionMenuOpen(false)}
+          style={{
+            flex: 1, backgroundColor: theme.scrim,
+            justifyContent: 'flex-end',
+          }}
+        >
+          <Pressable onPress={() => {}}>
+            <SheetCard style={{
+              marginHorizontal: 12, marginBottom: 16 + insets.bottom,
+              backgroundColor: theme.surface,
+              borderWidth: 1, borderColor: theme.hairline,
+              borderRadius: theme.radiusXl,
+              padding: 8,
+              boxShadow: `${theme.shadowAmbient}, ${theme.shadowInner}`,
+            }}>
+              <View style={{ paddingHorizontal: 12, paddingTop: 8, paddingBottom: 12 }}>
+                <Eyebrow>{selected.size} {selected.size === 1 ? 'card' : 'cards'} selected</Eyebrow>
+              </View>
+              <SelectionAction icon="arrow-right-circle" label="Move to binder…" onPress={onBulkMove} />
+              <SelectionAction icon="copy" label="Copy to binder…" onPress={onBulkCopy} />
+              <SelectionAction icon="trash-2" label="Delete" destructive onPress={onBulkDelete} />
+            </SheetCard>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      <BinderTargetSheet
+        verb="Move"
         rowIds={moveRowIds}
         binders={allBinders.filter((b) => b.id !== id)}
         onClose={() => setMoveRowIds([])}
@@ -1390,6 +1456,30 @@ export default function BinderView() {
           );
         }}
       />
+
+      {/* Copy keeps the source binder in the list so cards can be cloned
+          within the same binder. */}
+      <BinderTargetSheet
+        verb="Copy"
+        rowIds={copyRowIds}
+        binders={allBinders}
+        onClose={() => setCopyRowIds([])}
+        onPick={(targetBinderId) => {
+          const ids = copyRowIds;
+          setCopyRowIds([]);
+          copyCards.mutate(
+            { rowIds: ids, targetBinderId },
+            {
+              onSuccess: ({ copied }) => {
+                toast.success(`Copied ${copied} ${copied === 1 ? 'card' : 'cards'}`);
+                setSelecting(false);
+                setSelected(new Set());
+              },
+              onError: (e: any) => toast.error(e?.message ?? 'Could not copy'),
+            },
+          );
+        }}
+      />
     </Screen>
   );
 }
@@ -1401,7 +1491,7 @@ function pageMenuRowStyle(disabled?: boolean) {
     justifyContent: 'space-between' as const,
     paddingVertical: 14,
     borderTopWidth: 1,
-    borderTopColor: theme.border,
+    borderTopColor: theme.hairline,
     opacity: disabled ? 0.4 : 1,
   };
 }
@@ -1429,7 +1519,7 @@ function BinderListCards({
       contentContainerStyle={{ paddingHorizontal: 16, paddingTop: 8, paddingBottom: 32, gap: 6 }}
     >
       {rows.length === 0 ? (
-        <Text style={{ color: theme.textDim, textAlign: 'center', padding: 40, fontSize: 13 }}>
+        <Text style={{ color: theme.textDim, textAlign: 'center', padding: 40, fontSize: 13, fontFamily: theme.fontUI }}>
           No cards match this filter.
         </Text>
       ) : rows.map((r) => {
@@ -1443,14 +1533,16 @@ function BinderListCards({
             onPress={() => onTap(r)}
             onLongPress={() => onLongPress(r)}
             delayLongPress={280}
-            style={{
+            style={({ pressed }) => ({
               flexDirection: 'row', alignItems: 'center', gap: 12,
               padding: 10,
-              backgroundColor: theme.surface,
+              backgroundColor: isSelected ? theme.accentFaint : theme.surface,
               borderWidth: 1,
-              borderColor: isSelected ? theme.accent : theme.border,
+              borderColor: isSelected ? theme.accent : theme.hairline,
               borderRadius: theme.radius,
-            }}
+              boxShadow: theme.shadowInner,
+              transform: [{ scale: pressed ? 0.98 : 1 }],
+            })}
           >
             {selecting && (
               <Feather
@@ -1462,13 +1554,13 @@ function BinderListCards({
             {r.image_small ? (
               <Image
                 source={{ uri: r.image_small }}
-                style={{ width: 40, height: 56, borderRadius: 4, backgroundColor: theme.surface2 }}
+                style={{ width: 40, height: 56, borderRadius: 6, backgroundColor: theme.surface2 }}
               />
             ) : (
-              <View style={{ width: 40, height: 56, borderRadius: 4, backgroundColor: theme.surface2 }} />
+              <View style={{ width: 40, height: 56, borderRadius: 6, backgroundColor: theme.surface2 }} />
             )}
             <View style={{ flex: 1, minWidth: 0 }}>
-              <Text numberOfLines={1} style={{ color: theme.text, fontSize: 14, fontFamily: theme.fontUI }}>
+              <Text numberOfLines={1} style={{ color: theme.text, fontSize: 14, fontFamily: theme.fontUIBold }}>
                 {r.card_name}
               </Text>
               <Text numberOfLines={1} style={{ color: theme.textDim, fontSize: 11, fontFamily: theme.fontMono, marginTop: 2 }}>
@@ -1476,8 +1568,8 @@ function BinderListCards({
               </Text>
             </View>
             <View style={{ alignItems: 'flex-end', gap: 4 }}>
-              <Text style={{ color: theme.text, fontSize: 13, fontFamily: theme.fontMono }}>
-                {r.last_price_eur != null ? `€${r.last_price_eur.toFixed(2)}` : '—'}
+              <Text style={{ color: r.last_price_eur != null ? theme.text : theme.textMute, fontSize: 13, fontFamily: theme.fontMono }}>
+                {r.last_price_eur != null ? `€${r.last_price_eur.toFixed(2)}` : '·'}
               </Text>
               <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: statusColor }} />
             </View>
@@ -1511,15 +1603,16 @@ function CardActionSheet({
       <View style={{ flex: 1, justifyContent: 'flex-end', alignItems: 'center' }}>
         <Pressable
           onPress={onClose}
-          style={{ flex: 1, alignSelf: 'stretch', backgroundColor: 'rgba(0,0,0,0.6)' }}
+          style={{ flex: 1, alignSelf: 'stretch', backgroundColor: theme.scrim }}
         />
         <View style={{
           width: '100%', maxWidth: theme.maxContentW,
           backgroundColor: theme.surface,
-          borderTopLeftRadius: theme.radius * 2,
-          borderTopRightRadius: theme.radius * 2,
+          borderTopLeftRadius: theme.radiusXl,
+          borderTopRightRadius: theme.radiusXl,
           borderTopWidth: 1, borderLeftWidth: 1, borderRightWidth: 1,
-          borderColor: theme.borderStrong,
+          borderColor: theme.hairline,
+          boxShadow: theme.shadowInner,
           paddingHorizontal: 20, paddingTop: 18,
           paddingBottom: 28 + insets.bottom,
         }}>
@@ -1527,7 +1620,7 @@ function CardActionSheet({
             {row?.set_name}{row?.card_number ? ` · ${row.card_number}` : ''}{row?.rarity ? ` · ${row.rarity}` : ''}
           </Eyebrow>
           <Text style={{
-            fontFamily: theme.fontDisplay,
+            fontFamily: theme.fontDisplaySemi,
             fontSize: 22, color: theme.text, marginTop: 4, marginBottom: 16,
           }}>{row?.card_name}</Text>
 
@@ -1543,7 +1636,7 @@ function CardActionSheet({
             style={{
               flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
               paddingVertical: 14,
-              borderTopWidth: 1, borderTopColor: theme.border,
+              borderTopWidth: 1, borderTopColor: theme.hairline,
             }}>
             <Text style={{ color: theme.text, fontSize: 15 }}>Info</Text>
             <Feather name="chevron-right" size={16} color={theme.textDim} />
@@ -1554,7 +1647,7 @@ function CardActionSheet({
             style={{
               flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
               paddingVertical: 14,
-              borderTopWidth: 1, borderTopColor: theme.border,
+              borderTopWidth: 1, borderTopColor: theme.hairline,
             }}>
             <Text style={{ color: theme.text, fontSize: 15 }}>Move to binder…</Text>
             <Feather name="chevron-right" size={16} color={theme.textDim} />
@@ -1564,7 +1657,7 @@ function CardActionSheet({
             onPress={() => row && onDelete(row)}
             style={{
               paddingVertical: 14,
-              borderTopWidth: 1, borderTopColor: theme.border,
+              borderTopWidth: 1, borderTopColor: theme.hairline,
             }}>
             <Text style={{ color: theme.statusReally, fontSize: 15 }}>Delete</Text>
           </Pressable>
@@ -1574,9 +1667,10 @@ function CardActionSheet({
   );
 }
 
-function MoveTargetSheet({
-  rowIds, binders, onClose, onPick,
+function BinderTargetSheet({
+  verb, rowIds, binders, onClose, onPick,
 }: {
+  verb: 'Move' | 'Copy';
   rowIds: string[];
   binders: Binder[];
   onClose: () => void;
@@ -1596,24 +1690,25 @@ function MoveTargetSheet({
       <View style={{ flex: 1, justifyContent: 'flex-end', alignItems: 'center' }}>
         <Pressable
           onPress={onClose}
-          style={{ flex: 1, alignSelf: 'stretch', backgroundColor: 'rgba(0,0,0,0.6)' }}
+          style={{ flex: 1, alignSelf: 'stretch', backgroundColor: theme.scrim }}
         />
         <View style={{
           width: '100%', maxWidth: theme.maxContentW,
           maxHeight: '60%',
           backgroundColor: theme.surface,
-          borderTopLeftRadius: theme.radius * 2,
-          borderTopRightRadius: theme.radius * 2,
+          borderTopLeftRadius: theme.radiusXl,
+          borderTopRightRadius: theme.radiusXl,
           borderTopWidth: 1, borderLeftWidth: 1, borderRightWidth: 1,
-          borderColor: theme.borderStrong,
+          borderColor: theme.hairline,
+          boxShadow: theme.shadowInner,
           paddingHorizontal: 20, paddingTop: 18,
           paddingBottom: 24 + insets.bottom,
         }}>
           <Eyebrow>
-            Move {rowIds.length} {rowIds.length === 1 ? 'card' : 'cards'} to
+            {verb} {rowIds.length} {rowIds.length === 1 ? 'card' : 'cards'} to
           </Eyebrow>
           <Text style={{
-            fontFamily: theme.fontDisplay,
+            fontFamily: theme.fontDisplaySemi,
             fontSize: 20, color: theme.text, marginTop: 4, marginBottom: 12,
           }}>Choose a binder</Text>
           <ScrollView>
@@ -1624,7 +1719,7 @@ function MoveTargetSheet({
                 style={{
                   flexDirection: 'row', alignItems: 'center', gap: 10,
                   paddingVertical: 14, paddingHorizontal: 4,
-                  borderBottomWidth: 1, borderBottomColor: theme.border,
+                  borderBottomWidth: 1, borderBottomColor: theme.hairline,
                 }}>
                 {b.is_bulk && (
                   <Feather name="package" size={14} color={theme.accent} />
@@ -1645,7 +1740,7 @@ function MoveTargetSheet({
             ))}
             {binders.length === 0 && (
               <Text style={{ color: theme.textDim, fontSize: 13, paddingVertical: 16 }}>
-                No other binders. Create one to move cards into.
+                No binders available. Create one first.
               </Text>
             )}
           </ScrollView>
@@ -1662,15 +1757,14 @@ function ShareSheet({
   binder: Binder | null;
   username: string | null;
   onClose: () => void;
-  onChangeVisibility: (v: 'private' | 'unlisted' | 'public') => void;
+  onChangeVisibility: (v: Visibility) => void;
   onCopy: (label: string, text: string) => void;
 }) {
   const insets = useSafeAreaInsets();
   if (!binder) return null;
   const v = binder.visibility ?? 'private';
-  // The mobile app deep-links to /share and /u routes; for the web bundle
-  // we use the same paths off the current origin. Falls back to a plain
-  // path if there's no window (native).
+  // Web builds share links off the current origin; native has no window and
+  // falls back to a plain path.
   const origin =
     typeof window !== 'undefined' && window.location ? window.location.origin : '';
   const shareUrl = binder.share_token ? `${origin}/share/${binder.share_token}` : null;
@@ -1688,27 +1782,28 @@ function ShareSheet({
       <View style={{ flex: 1, justifyContent: 'flex-end', alignItems: 'center' }}>
         <Pressable
           onPress={onClose}
-          style={{ flex: 1, alignSelf: 'stretch', backgroundColor: 'rgba(0,0,0,0.6)' }}
+          style={{ flex: 1, alignSelf: 'stretch', backgroundColor: theme.scrim }}
         />
         <View style={{
           width: '100%', maxWidth: theme.maxContentW,
           backgroundColor: theme.surface,
-          borderTopLeftRadius: theme.radius * 2,
-          borderTopRightRadius: theme.radius * 2,
+          borderTopLeftRadius: theme.radiusXl,
+          borderTopRightRadius: theme.radiusXl,
           borderTopWidth: 1, borderLeftWidth: 1, borderRightWidth: 1,
-          borderColor: theme.borderStrong,
+          borderColor: theme.hairline,
+          boxShadow: theme.shadowInner,
           paddingHorizontal: 20, paddingTop: 18,
           paddingBottom: 28 + insets.bottom,
         }}>
           <Eyebrow>Share</Eyebrow>
           <Text style={{
-            fontFamily: theme.fontDisplay,
+            fontFamily: theme.fontDisplaySemi,
             fontSize: 22, color: theme.text, marginTop: 4, marginBottom: 14,
           }}>{binder.name}</Text>
 
-          <VisibilityRow label="Private"  desc="Only you can see this binder."           active={v === 'private'}  onPress={() => onChangeVisibility('private')}  icon="lock" />
-          <VisibilityRow label="Unlisted" desc="Anyone with the link can view."           active={v === 'unlisted'} onPress={() => onChangeVisibility('unlisted')} icon="link" />
-          <VisibilityRow label="Public"   desc="Listed on your profile, link sharable."   active={v === 'public'}   onPress={() => onChangeVisibility('public')}   icon="globe" />
+          <VisibilityRow label="Private" desc="Only you can see this binder."             active={v === 'private'} onPress={() => onChangeVisibility('private')} icon="lock" />
+          <VisibilityRow label="Friends" desc="Your accepted friends can view."           active={v === 'friends'} onPress={() => onChangeVisibility('friends')} icon="users" />
+          <VisibilityRow label="Public"  desc="Listed on your profile, link sharable."    active={v === 'public'}  onPress={() => onChangeVisibility('public')}  icon="globe" />
 
           {shareUrl && (
             <Pressable
@@ -1761,6 +1856,89 @@ function ShareSheet({
   );
 }
 
+// Status filter bottom sheet.
+function FilterSheet({
+  open, filter, rows, onClose, onPick,
+}: {
+  open: boolean;
+  filter: Filter;
+  rows: CollectionRow[];
+  onClose: () => void;
+  onPick: (f: Filter) => void;
+}) {
+  const insets = useSafeAreaInsets();
+  const count = (f: Filter) =>
+    f === 'all' ? rows.length : rows.filter((r) => r.status === f).length;
+  const options: { key: Filter; label: string; color: string | null }[] = [
+    { key: 'all',    label: 'All cards', color: null },
+    { key: 'have',   label: 'Have',      color: theme.statusHave },
+    { key: 'want',   label: 'Want',      color: theme.statusWant },
+    { key: 'really', label: 'Need',      color: theme.statusReally },
+  ];
+  return (
+    <Modal
+      visible={open}
+      transparent
+      animationType="slide"
+      statusBarTranslucent
+      navigationBarTranslucent
+      onRequestClose={onClose}
+    >
+      <View style={{ flex: 1, justifyContent: 'flex-end', alignItems: 'center' }}>
+        <Pressable
+          onPress={onClose}
+          style={{ flex: 1, alignSelf: 'stretch', backgroundColor: theme.scrim }}
+        />
+        <View style={{
+          width: '100%', maxWidth: theme.maxContentW,
+          backgroundColor: theme.surface,
+          borderTopLeftRadius: theme.radiusXl,
+          borderTopRightRadius: theme.radiusXl,
+          borderTopWidth: 1, borderLeftWidth: 1, borderRightWidth: 1,
+          borderColor: theme.hairline,
+          boxShadow: theme.shadowInner,
+          paddingHorizontal: 20, paddingTop: 18,
+          paddingBottom: 24 + insets.bottom,
+        }}>
+          <Eyebrow>Filter</Eyebrow>
+          <Text style={{
+            fontFamily: theme.fontDisplaySemi,
+            fontSize: 22, color: theme.text, marginTop: 4, marginBottom: 10,
+          }}>Show cards</Text>
+          {options.map((o) => {
+            const active = filter === o.key;
+            return (
+              <Pressable
+                key={o.key}
+                onPress={() => onPick(o.key)}
+                style={pageMenuRowStyle()}
+              >
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                  {o.color ? (
+                    <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: o.color }} />
+                  ) : (
+                    <Feather name="layers" size={13} color={theme.textDim} />
+                  )}
+                  <Text style={{
+                    color: active ? theme.accent : theme.text,
+                    fontSize: 15, fontFamily: active ? theme.fontUIBold : theme.fontUI,
+                  }}>{o.label}</Text>
+                </View>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                  <Text style={{
+                    color: theme.textDim, fontSize: 12, fontFamily: theme.fontMono,
+                  }}>{count(o.key)}</Text>
+                  {active && <Feather name="check" size={16} color={theme.accent} />}
+                </View>
+              </Pressable>
+            );
+          })}
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 function VisibilityRow({
   label, desc, active, onPress, icon,
 }: {
@@ -1768,7 +1946,7 @@ function VisibilityRow({
   desc: string;
   active: boolean;
   onPress: () => void;
-  icon: 'lock' | 'link' | 'globe';
+  icon: 'lock' | 'users' | 'globe';
 }) {
   return (
     <Pressable
@@ -1796,27 +1974,27 @@ function ArrowBtn({ dir, disabled, onPress }: { dir: 'left' | 'right'; disabled?
     <Pressable
       onPress={onPress}
       disabled={disabled}
-      style={{
+      style={({ pressed }) => ({
         width: 38, height: 38, borderRadius: 19,
-        backgroundColor: theme.surface,
-        borderWidth: 1, borderColor: theme.border,
+        backgroundColor: pressed ? theme.glassStrong : theme.glass,
+        borderWidth: 1, borderColor: theme.hairline,
         alignItems: 'center', justifyContent: 'center',
         opacity: disabled ? 0.4 : 1,
-      }}>
+        boxShadow: theme.shadowInner,
+        transform: [{ scale: pressed ? 0.9 : 1 }],
+      })}>
       <Feather name={dir === 'left' ? 'chevron-left' : 'chevron-right'} size={18} color={theme.text} />
     </Pressable>
   );
 }
 
 // ─── Page browser ──────────────────────────────────────────────────────
-// Full-screen modal that renders every page in the binder as a thumbnail
-// "blob." Drag-and-drop on a blob inserts the dragged page at the drop
-// target's index (shifting the pages between by one). Each blob has a ⋮
-// button that opens a small actions sheet with Rename + Delete.
+// Full-screen modal showing every page as a thumbnail blob; drag-and-drop
+// inserts the dragged page at the drop target's index.
 
 function PageBrowserModal({
   open, onClose, binder, pages, cardByPos, current, pageCount, slotsPerPage,
-  onSelectPage, onReorderPage, onRenamePage, onDeletePage, onAddPage, onMovePage,
+  onSelectPage, onReorderPage, onRenamePage, onDeletePage, onAddPage,
 }: {
   open: boolean;
   onClose: () => void;
@@ -1831,7 +2009,6 @@ function PageBrowserModal({
   onRenamePage: (page: BinderPage) => void;
   onDeletePage: (page: BinderPage) => void;
   onAddPage: () => void;
-  onMovePage: (page: BinderPage, dir: 'left' | 'right') => void;
 }) {
   const insets = useSafeAreaInsets();
   const screenW = clampToContent(Dimensions.get('window').width);
@@ -1857,10 +2034,8 @@ function PageBrowserModal({
   const dragY = useSharedValue(0);
   const [actionsPage, setActionsPage] = useState<BinderPage | null>(null);
 
-  // Mirrors of the React state for the UI-thread worklets — gesture callbacks
-  // run on the UI thread now and can't read React state directly, so the
-  // shared values are the source of truth during the drag and the React state
-  // setters are called via runOnJS only when the state actually changes.
+  // Shared-value mirrors for the UI-thread worklets; worklets can't read
+  // React state, so these are the source of truth during a drag.
   const dragIdxSV = useSharedValue<number | null>(null);
   const hoverIdxSV = useSharedValue<number | null>(null);
   const dragIdxRef = useRef<number | null>(null);
@@ -1868,18 +2043,8 @@ function PageBrowserModal({
   const hoverIdxRef = useRef<number | null>(null);
   hoverIdxRef.current = hoverIdx;
 
-  // Auto-scroll while reordering: when the finger sits near the top/bottom
-  // of the scroll viewport during a drag, scroll the page list automatically.
-  //
-  // Implementation note: the earlier version drove this with a JS-thread
-  // setInterval calling ScrollView.scrollTo, which contended with React
-  // re-renders from setHoverIdx and felt visibly laggy. Now everything that
-  // ticks during the drag runs on the UI thread:
-  //   - useAnimatedScrollHandler keeps scrollYSV in sync with the native
-  //     scroll offset (UI thread, no JS bridge).
-  //   - useFrameCallback runs every UI-thread frame and calls the Reanimated
-  //     scrollTo() worklet, which scrolls natively without touching JS.
-  //   - The JS-thread gesture only writes direction + speed shared values.
+  // Auto-scroll while reordering. Everything that ticks during the drag runs
+  // on the UI thread; the gesture only writes direction/speed shared values.
   const scrollRef = useAnimatedRef<Animated.ScrollView>();
   const scrollYSV = useSharedValue(0);
   const viewportHSV = useSharedValue(0);
@@ -1896,14 +2061,11 @@ function PageBrowserModal({
     );
     if (next === scrollYSV.value) return;
     scrollTo(scrollRef, 0, next, false);
-    // Update SV ourselves rather than waiting for onScroll to round-trip:
-    // useAnimatedScrollHandler fires after the native scroll event lands,
-    // which can be a frame behind. Without this, the next frame computes
-    // its "next" position against a stale base and visibly stutters.
+    // Write scrollYSV directly; the scroll handler lands a frame behind and
+    // a stale base makes the next frame stutter.
     scrollYSV.value = next;
-    // No need to compensate dragY for scroll — the overlay now lives
-    // OUTSIDE the ScrollView and renders at screen-absolute coordinates,
-    // so the scroll doesn't move it.
+    // No dragY compensation for scroll; the overlay renders outside the
+    // ScrollView at screen-absolute coordinates.
   }, true);
   const animatedScrollHandler = useAnimatedScrollHandler({
     onScroll: (e) => { scrollYSV.value = e.contentOffset.y; },
@@ -1912,9 +2074,8 @@ function PageBrowserModal({
 
   const panGesture = useMemo(() => {
     const pagesLen = pages.length;
-    // JS handlers — invoked via runOnJS from the worklet callbacks. Captured
-    // in the useMemo closure so they always see the latest `pages` and
-    // `onReorderPage`. setDragIdx/setHoverIdx are stable React setters.
+    // JS handlers invoked via runOnJS; captured in the useMemo closure so
+    // they see the latest `pages` and `onReorderPage`.
     const onStartJS = (idx: number) => {
       setDragIdx(idx);
       setHoverIdx(idx);
@@ -1938,12 +2099,11 @@ function PageBrowserModal({
     };
     return Gesture.Pan()
       .activateAfterLongPress(300)
-      // No .runOnJS(true) — callbacks run as worklets on the UI thread so the
-      // drag position and auto-scroll trigger update every frame even when
-      // the JS thread is busy with renders.
+      // No .runOnJS(true): callbacks run as UI-thread worklets so drag and
+      // auto-scroll keep updating while the JS thread is busy with renders.
       .onStart((e) => {
         'worklet';
-        // Inline blobAt — closures over pagesLen captured above.
+        // Inline blob hit-test; closes over pagesLen.
         const col = Math.floor(e.x / (blobW + BLOB_GAP));
         if (col < 0 || col >= COLS_2) return;
         const row = Math.floor(e.y / (blobH + BLOB_GAP));
@@ -1952,8 +2112,8 @@ function PageBrowserModal({
         if (idx < 0 || idx >= pagesLen) return;
         dragIdxSV.value = idx;
         hoverIdxSV.value = idx;
-        // Overlay sits outside the ScrollView and renders at screen
-        // coordinates — absoluteX/Y stay correct as content scrolls.
+        // Overlay renders at screen coordinates outside the ScrollView;
+        // absoluteX/Y stay correct as content scrolls.
         dragX.value = e.absoluteX;
         dragY.value = e.absoluteY;
         runOnJS(onStartJS)(idx);
@@ -2044,16 +2204,12 @@ function PageBrowserModal({
             flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
             paddingHorizontal: 16, paddingTop: 6, paddingBottom: 6,
           }}>
-            <Pressable onPress={onClose} hitSlop={12}>
-              <Feather name="x" size={22} color={theme.textDim} />
-            </Pressable>
+            <IconDisc name="x" size={36} onPress={onClose} />
             <Text style={{
               fontFamily: theme.fontMono, fontSize: 12, color: theme.text,
               letterSpacing: 1.5, textTransform: 'uppercase',
             }}>Pages · {pageCount}</Text>
-            <Pressable onPress={onAddPage} hitSlop={12}>
-              <Feather name="plus" size={22} color={theme.accent} />
-            </Pressable>
+            <IconDisc name="plus" size={36} active onPress={onAddPage} />
           </View>
           <View style={{ paddingHorizontal: 24, paddingTop: 4, paddingBottom: 10 }}>
             <Text style={{
@@ -2069,8 +2225,7 @@ function PageBrowserModal({
             onLayout={(e) => { viewportHSV.value = e.nativeEvent.layout.height; }}
             onContentSizeChange={(_w, h) => { contentHSV.value = h; }}
             // scrollEnabled={false} doesn't block Reanimated's scrollTo
-            // worklet, so auto-scroll still works during drag. The animated
-            // scroll handler keeps scrollYSV in sync on the UI thread.
+            // worklet, so auto-scroll still works during drag.
             onScroll={animatedScrollHandler}
             scrollEventThrottle={16}
           >
@@ -2130,17 +2285,17 @@ function PageBrowserModal({
                     }}>
                       <Pressable
                         onPress={onAddPage}
-                        style={{
+                        style={({ pressed }) => ({
                           width: blobW, height: blobH,
                           borderRadius: theme.radius,
                           borderWidth: 1,
                           borderStyle: 'dashed',
                           borderColor: theme.borderStrong,
-                          backgroundColor: theme.surface,
+                          backgroundColor: pressed ? theme.accentFaint : theme.glass,
                           alignItems: 'center',
                           justifyContent: 'center',
                           gap: 8,
-                        }}>
+                        })}>
                         <Feather name="plus" size={28} color={theme.accent} />
                         <Text style={{
                           color: theme.accent, fontFamily: theme.fontUIBold,
@@ -2156,11 +2311,8 @@ function PageBrowserModal({
             </GestureDetector>
           </Animated.ScrollView>
 
-          {/* Dragged blob overlay — rendered OUTSIDE the ScrollView so it
-              sits at screen-absolute coordinates and doesn't move when the
-              auto-scroll fires. dragX/dragY are populated from the gesture's
-              absoluteX/absoluteY, so translate(dragX − blobW/2, dragY − blobH/2)
-              centers the blob on the finger regardless of scroll position. */}
+          {/* Dragged blob overlay; rendered outside the ScrollView at
+              screen-absolute coordinates so auto-scroll doesn't move it. */}
           {dragIdx !== null && pages[dragIdx] && (
             <Animated.View
               pointerEvents="none"
@@ -2193,17 +2345,29 @@ function PageBrowserModal({
             </Animated.View>
           )}
 
-          <PageActionsSheet
-            page={actionsPage}
-            canDelete={pageCount > 1}
-            canMoveLeft={actionsPage != null && actionsPage.page_index > 0}
-            canMoveRight={actionsPage != null && actionsPage.page_index < pageCount - 1}
-            onClose={() => setActionsPage(null)}
-            onRename={(p) => { setActionsPage(null); onRenamePage(p); }}
-            onDelete={(p) => { setActionsPage(null); onDeletePage(p); }}
-            onMoveLeft={(p) => { setActionsPage(null); onMovePage(p, 'left'); }}
-            onMoveRight={(p) => { setActionsPage(null); onMovePage(p, 'right'); }}
-          />
+          {(() => {
+            // Delete-disabled reason renders inline; a toast would be covered
+            // by this modal, which sits above the Toast host.
+            const actionsPageHasCards = actionsPage != null && Array.from({
+              length: slotsPerPage,
+            }).some((_, i) => cardByPos.has(actionsPage.page_index * slotsPerPage + i));
+            const isLastPage = pageCount <= 1;
+            const deleteDisabledReason = isLastPage
+              ? 'A binder needs at least one page.'
+              : actionsPageHasCards
+                ? 'Remove all cards from this page first.'
+                : null;
+            return (
+              <PageActionsSheet
+                page={actionsPage}
+                canDelete={deleteDisabledReason === null}
+                deleteDisabledReason={deleteDisabledReason}
+                onClose={() => setActionsPage(null)}
+                onRename={(p) => { setActionsPage(null); onRenamePage(p); }}
+                onDelete={(p) => { setActionsPage(null); onDeletePage(p); }}
+              />
+            );
+          })()}
         </Screen>
       </GestureHandlerRootView>
     </Modal>
@@ -2250,9 +2414,10 @@ function PageBlob({
         backgroundColor: theme.surface,
         borderRadius: theme.radius,
         borderWidth: isCurrent || isHovered ? 2 : 1,
-        borderColor: isHovered ? theme.accent : isCurrent ? theme.accent : theme.border,
+        borderColor: isHovered ? theme.accent : isCurrent ? theme.accent : theme.hairline,
         padding: blobPad,
         opacity: isDragged ? 0.25 : 1,
+        boxShadow: theme.shadowInner,
       }}>
       <View style={{
         flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
@@ -2304,18 +2469,15 @@ function PageBlob({
 }
 
 function PageActionsSheet({
-  page, canDelete, canMoveLeft, canMoveRight,
-  onClose, onRename, onDelete, onMoveLeft, onMoveRight,
+  page, canDelete, deleteDisabledReason,
+  onClose, onRename, onDelete,
 }: {
   page: BinderPage | null;
   canDelete: boolean;
-  canMoveLeft: boolean;
-  canMoveRight: boolean;
+  deleteDisabledReason: string | null;
   onClose: () => void;
   onRename: (p: BinderPage) => void;
   onDelete: (p: BinderPage) => void;
-  onMoveLeft: (p: BinderPage) => void;
-  onMoveRight: (p: BinderPage) => void;
 }) {
   const insets = useSafeAreaInsets();
   return (
@@ -2330,21 +2492,22 @@ function PageActionsSheet({
       <View style={{ flex: 1, justifyContent: 'flex-end', alignItems: 'center' }}>
         <Pressable
           onPress={onClose}
-          style={{ flex: 1, alignSelf: 'stretch', backgroundColor: 'rgba(0,0,0,0.6)' }}
+          style={{ flex: 1, alignSelf: 'stretch', backgroundColor: theme.scrim }}
         />
         <View style={{
           width: '100%', maxWidth: theme.maxContentW,
           backgroundColor: theme.surface,
-          borderTopLeftRadius: theme.radius * 2,
-          borderTopRightRadius: theme.radius * 2,
+          borderTopLeftRadius: theme.radiusXl,
+          borderTopRightRadius: theme.radiusXl,
           borderTopWidth: 1, borderLeftWidth: 1, borderRightWidth: 1,
-          borderColor: theme.borderStrong,
+          borderColor: theme.hairline,
+          boxShadow: theme.shadowInner,
           paddingHorizontal: 20, paddingTop: 18,
           paddingBottom: 28 + insets.bottom,
         }}>
           <Eyebrow>Page {page ? String(page.page_index + 1).padStart(2, '0') : '--'}</Eyebrow>
           <Text style={{
-            fontFamily: theme.fontDisplay,
+            fontFamily: theme.fontDisplaySemi,
             fontSize: 22, color: theme.text, marginTop: 4, marginBottom: 16,
           }}>{page?.title || 'Untitled page'}</Text>
 
@@ -2358,22 +2521,6 @@ function PageActionsSheet({
           </Pressable>
 
           <Pressable
-            onPress={() => page && onMoveLeft(page)}
-            disabled={!canMoveLeft}
-            style={pageMenuRowStyle(!canMoveLeft)}>
-            <Text style={pageMenuLabelStyle(!canMoveLeft)}>Move page left</Text>
-            <Feather name="chevron-left" size={14} color={canMoveLeft ? theme.textDim : theme.textMute} />
-          </Pressable>
-
-          <Pressable
-            onPress={() => page && onMoveRight(page)}
-            disabled={!canMoveRight}
-            style={pageMenuRowStyle(!canMoveRight)}>
-            <Text style={pageMenuLabelStyle(!canMoveRight)}>Move page right</Text>
-            <Feather name="chevron-right" size={14} color={canMoveRight ? theme.textDim : theme.textMute} />
-          </Pressable>
-
-          <Pressable
             onPress={() => page && onDelete(page)}
             disabled={!canDelete}
             style={pageMenuRowStyle(!canDelete)}>
@@ -2382,8 +2529,43 @@ function PageActionsSheet({
             </Text>
             <Feather name="trash-2" size={14} color={canDelete ? theme.statusReally : theme.textMute} />
           </Pressable>
+          {!canDelete && deleteDisabledReason && (
+            <Text style={{
+              color: theme.textDim, fontSize: 11,
+              fontFamily: theme.fontMono, marginTop: 6,
+              letterSpacing: 0.3,
+            }}>
+              {deleteDisabledReason}
+            </Text>
+          )}
         </View>
       </View>
     </Modal>
+  );
+}
+
+function SelectionAction({
+  icon, label, onPress, destructive = false,
+}: {
+  icon: keyof typeof Feather.glyphMap;
+  label: string;
+  onPress: () => void;
+  destructive?: boolean;
+}) {
+  const tint = destructive ? theme.statusReally : theme.text;
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => ({
+        flexDirection: 'row', alignItems: 'center', gap: 14,
+        paddingVertical: 14, paddingHorizontal: 14,
+        borderRadius: theme.radius,
+        backgroundColor: pressed ? theme.surface2 : 'transparent',
+      })}>
+      <Feather name={icon} size={18} color={tint} />
+      <Text style={{
+        color: tint, fontSize: 15, fontFamily: theme.fontUI,
+      }}>{label}</Text>
+    </Pressable>
   );
 }
