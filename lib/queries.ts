@@ -1,7 +1,7 @@
 // React-Query hooks wrapping Supabase + PokemonTCG.io.
-// All collection mutations are optimistic; the query cache is the source
-// of truth between fetches.
 
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Image } from 'react-native';
 import {
   useQuery,
   useInfiniteQuery,
@@ -13,10 +13,17 @@ import { supabase } from './supabase';
 import {
   searchCards,
   getCard,
+  getCardFacts,
+  getCardVariants,
   getSets,
   getSet,
+  getAllCardIds,
   parseSearchQuery,
+  cardImages,
+  fallbackImageUrls,
   SEARCH_ITEMS_PER_PAGE,
+  INTL_LOCALES,
+  CardVariantsInfo,
   TcgdexBrief,
   TcgdexSet,
   TcgdexSetDetail,
@@ -25,7 +32,11 @@ import {
 import {
   Binder,
   BinderPage,
+  CardFacts,
   CollectionRow,
+  PaletteEntry,
+  FriendState,
+  Friendship,
   Profile,
   Status,
   TcgCard,
@@ -51,9 +62,8 @@ export function useBinders() {
   return useQuery({
     queryKey: KEY.binders,
     queryFn: async (): Promise<Binder[]> => {
-      // RLS now allows reading non-private binders cross-user (for public
-      // viewing). The "my binders" list must filter explicitly to the
-      // signed-in user, otherwise every public binder in the DB shows up.
+      // RLS exposes non-private binders cross-user, so this list must
+      // filter explicitly to the signed-in user.
       const { data: u } = await supabase.auth.getUser();
       if (!u.user) return [];
       const { data, error } = await supabase
@@ -68,8 +78,7 @@ export function useBinders() {
   });
 }
 
-/** Persist a new ordering of the user's binders. Caller passes a list of
- *  binder ids in the desired display order; each gets `position = index`. */
+/** Persist a new binder ordering; each id gets `position = index`. */
 export function useReorderBinders() {
   const qc = useQueryClient();
   return useMutation({
@@ -89,10 +98,8 @@ export function useReorderBinders() {
       return { count: orderedIds.length };
     },
     onMutate: async (orderedIds) => {
-      // Apply the optimistic order SYNCHRONOUSLY before any await — otherwise
-      // there's a microtask window between mutate() and the cache update where
-      // DraggableFlatList snaps back to the prior `data` prop and the list
-      // looks "chaotic" for a frame after the drop.
+      // Apply the optimistic order synchronously before any await, or
+      // DraggableFlatList snaps back to the prior data for a frame.
       const prev = qc.getQueryData<Binder[]>(KEY.binders);
       if (prev) {
         const byId = new Map(prev.map((b) => [b.id, b]));
@@ -101,19 +108,15 @@ export function useReorderBinders() {
           .filter((b): b is Binder => !!b);
         qc.setQueryData(KEY.binders, next);
       }
-      // Cancel any in-flight refetch so it can't overwrite our optimistic
-      // order before the mutation commits.
+      // Cancel in-flight refetches so they can't overwrite the optimistic order.
       await qc.cancelQueries({ queryKey: KEY.binders });
       return { prev };
     },
     onError: (_e, _v, ctx) => {
       if (ctx?.prev) qc.setQueryData(KEY.binders, ctx.prev);
     },
-    // Don't auto-invalidate on success — the optimistic order is already
-    // correct and a refetch would briefly show the server's pre-update state
-    // until the new positions land. Only refetch on error (via setQueryData
-    // rollback above, which doesn't trigger a network call, but the next
-    // mount/visibility change will pull fresh data anyway).
+    // Skip invalidation on success: a refetch would briefly show the
+    // server's pre-update order. Only refetch on error.
     onSettled: (_data, error) => {
       if (error) qc.invalidateQueries({ queryKey: KEY.binders });
     },
@@ -126,9 +129,8 @@ export function useBinder(binderId: string | undefined) {
     enabled: !!binderId,
     queryFn: async (): Promise<Binder | null> => {
       if (!binderId) return null;
-      // Same rationale as useBinders — restrict to the signed-in user so
-      // the authed binder view can't accidentally show a public binder
-      // belonging to someone else.
+      // Restrict to the signed-in user so the authed view can't show
+      // someone else's public binder.
       const { data: u } = await supabase.auth.getUser();
       if (!u.user) return null;
       const { data, error } = await supabase
@@ -246,9 +248,8 @@ export function useAddPage() {
         .select('id')
         .single();
       if (error) throw error;
-      // Insert-after: page is created at the end, then reorder_binder_page
-      // shifts it (and the rows + card positions in between) into place.
-      // Skip the reorder when afterIndex already points to the last slot.
+      // Insert-after: the page is created at the end, then reorder_binder_page
+      // shifts it into place. Skip the reorder when it already lands last.
       const targetIndex = input.afterIndex !== undefined ? input.afterIndex + 1 : next;
       if (targetIndex !== next && inserted?.id) {
         const { error: rErr } = await supabase.rpc('reorder_binder_page', {
@@ -285,12 +286,21 @@ export function useUpdatePageTitle() {
 // ─────────────────────────────────────────────────────────────
 // Collection — list across all binders, or scoped to one binder
 // ─────────────────────────────────────────────────────────────
+
+/** TCGdex has no artwork for Trainer/Galarian Gallery subsets (letter-prefixed
+ *  numbers like TG01); fall back to PokemonTCG.io. The DB row is untouched. */
+function healRowImages(row: CollectionRow): CollectionRow {
+  if (row.image_small || !/^[A-Za-z]/.test(row.card_number)) return row;
+  const img = fallbackImageUrls(row.set_id, row.card_number);
+  return { ...row, image_small: img.small, image_large: img.large };
+}
+
 export function useCollection() {
   return useQuery({
     queryKey: KEY.collection,
     queryFn: async (): Promise<CollectionRow[]> => {
-      // RLS now lets us read cards from non-private binders cross-user.
-      // The "my collection" list must stay scoped to the signed-in user.
+      // RLS exposes cards from non-private binders cross-user, so this
+      // list must stay scoped to the signed-in user.
       const { data: u } = await supabase.auth.getUser();
       if (!u.user) return [];
       const { data, error } = await supabase
@@ -299,7 +309,7 @@ export function useCollection() {
         .eq('user_id', u.user.id)
         .order('added_at', { ascending: false });
       if (error) throw error;
-      return data as CollectionRow[];
+      return (data as CollectionRow[]).map(healRowImages);
     },
   });
 }
@@ -319,16 +329,13 @@ export function useCollectionByBinder(binderId: string | undefined) {
         .eq('user_id', u.user.id)
         .order('position', { ascending: true });
       if (error) throw error;
-      return data as CollectionRow[];
+      return (data as CollectionRow[]).map(healRowImages);
     },
   });
 }
 
-/**
- * Returns the first row found for a card_id. Used by card detail when no
- * specific instance is requested (e.g. coming from search). May return null
- * if the user owns no copies of this card.
- */
+/** First row found for a card_id. Used by card detail when no specific
+ *  instance is requested. */
 export function useCollectionItem(cardId: string | undefined) {
   return useQuery({
     queryKey: ['collection', cardId],
@@ -345,13 +352,12 @@ export function useCollectionItem(cardId: string | undefined) {
         .limit(1)
         .maybeSingle();
       if (error) throw error;
-      return data as CollectionRow | null;
+      return data ? healRowImages(data as CollectionRow) : null;
     },
   });
 }
 
-/** All rows the user owns for a given card_id (across all binders).
- * Used by the aggregate card-detail view to show a per-condition breakdown. */
+/** All owned rows for a card_id across binders. */
 export function useCollectionItemsByCardId(cardId: string | undefined) {
   return useQuery({
     queryKey: ['collection', 'byCard', cardId ?? ''],
@@ -366,14 +372,12 @@ export function useCollectionItemsByCardId(cardId: string | undefined) {
         .eq('card_id', cardId)
         .eq('user_id', u.user.id);
       if (error) throw error;
-      return (data ?? []) as CollectionRow[];
+      return ((data ?? []) as CollectionRow[]).map(healRowImages);
     },
   });
 }
 
-/** Look up a specific row by its UUID — used when card detail is opened
- * from a binder, action sheet, or any other context that already knows
- * exactly which instance the user tapped. */
+/** Look up a specific row by UUID, for contexts that know the exact instance. */
 export function useCollectionRowById(rowId: string | undefined) {
   return useQuery({
     queryKey: ['collection', 'row', rowId ?? ''],
@@ -389,7 +393,7 @@ export function useCollectionRowById(rowId: string | undefined) {
         .eq('user_id', u.user.id)
         .maybeSingle();
       if (error) throw error;
-      return data as CollectionRow | null;
+      return data ? healRowImages(data as CollectionRow) : null;
     },
   });
 }
@@ -397,11 +401,8 @@ export function useCollectionRowById(rowId: string | undefined) {
 // ─────────────────────────────────────────────────────────────
 // Mutations
 // ─────────────────────────────────────────────────────────────
-/**
- * Each call adds ONE physical card instance — a fresh row at the next free
- * position in the binder. Same card_id can appear multiple times in the same
- * binder; each row carries its own status/condition.
- */
+/** Adds one card instance: a fresh row at the next free position. The same
+ *  card_id can appear multiple times per binder, each row with its own state. */
 export function useUpsertCard() {
   const qc = useQueryClient();
   return useMutation({
@@ -414,8 +415,7 @@ export function useUpsertCard() {
       card: TcgCard;
       status: Status;
       binderId: string;
-      // When set (empty-slot flow), insert at this exact slot. Otherwise
-      // append after the highest-positioned card in the binder.
+      // Insert at this exact slot when set; otherwise append at the end.
       position?: number;
     }): Promise<CollectionRow> => {
       const { data: userData } = await supabase.auth.getUser();
@@ -460,12 +460,8 @@ export function useUpsertCard() {
   });
 }
 
-/**
- * Bulk-update positions in a binder. Used by drag-and-drop.
- * Pass an array of { id, position } pairs; this writes them all in one batch.
- * The binder_position_unique constraint is deferrable, so intermediate
- * collisions within the transaction are allowed.
- */
+/** Bulk-update positions in a binder (drag-and-drop). binder_position_unique
+ *  is deferrable, so intermediate collisions within the transaction are fine. */
 export function useReorderCards() {
   const qc = useQueryClient();
   return useMutation({
@@ -512,11 +508,8 @@ export function useReorderCards() {
 }
 
 async function ensureBinderHasSpace(binderId: string) {
-  // Page count MUST derive from max(position), not row count — drag-and-drop
-  // and bulk moves leave sparse positions (e.g. cards at 0 and 14 with empty
-  // slots in between). With count-based math the binder view would render
-  // page 1 from maxPos but binder_pages wouldn't have a row for it, so the
-  // page-title pill would grey out and the page menu would skip the page.
+  // Page count must derive from max(position), not row count: drag-and-drop
+  // and bulk moves leave sparse positions.
   const [{ data: binder }, { data: pages }, { data: lastCard }] = await Promise.all([
     supabase.from('binders').select('grid_cols,grid_rows').eq('id', binderId).single(),
     supabase.from('binder_pages').select('page_index').eq('binder_id', binderId)
@@ -538,10 +531,8 @@ async function ensureBinderHasSpace(binderId: string) {
   await supabase.from('binder_pages').insert(toInsert);
 }
 
-/** Lazy self-heal for binders whose `binder_pages` rows are out of sync
- *  with the actual card positions (a class of bug that pre-dated the move /
- *  upsert fix — sparse positions left missing pages). The binder view calls
- *  this once on mount; it's a no-op when everything's already consistent. */
+/** Repairs binders whose binder_pages rows lag behind card positions.
+ *  Called once on binder-view mount; no-op when already consistent. */
 export function useEnsureBinderPages() {
   const qc = useQueryClient();
   return useMutation({
@@ -666,8 +657,7 @@ export function useRemoveCard() {
   });
 }
 
-/** Bulk-delete multiple rows in one round-trip. Used by select-multiple
- * mode in the binder view. */
+/** Bulk-delete rows in one round-trip. */
 export function useRemoveCards() {
   const qc = useQueryClient();
   return useMutation({
@@ -687,29 +677,23 @@ export function useRemoveCards() {
 // PokemonTCG.io
 // ─────────────────────────────────────────────────────────────
 export function useSearch(q: string) {
-  // Parse here (not in the component) so the query key reflects the
-  // structured filters — two queries that differ only in trailing collector
-  // number get separate cache entries.
+  // Parse here so the query key reflects the structured filters; queries
+  // differing only in collector number get separate cache entries.
   const parsed = parseSearchQuery(q);
   return useInfiniteQuery({
     queryKey: ['search', parsed.name, parsed.localId ?? ''],
-    // A name fragment is searchable from 2 chars; a localId alone is a valid
-    // query on its own (no minimum length).
     enabled: parsed.name.trim().length >= 2 || !!parsed.localId,
     initialPageParam: 1,
     queryFn: async ({ pageParam }) => {
       const raw = await searchCards(parsed.name, { localId: parsed.localId, page: pageParam });
-      // Mirror the Sets list filter: drop cards from sets whose shortcode
-      // starts with a capital letter. Card IDs are `<setId>-<localId>`, so
-      // we read the prefix once and toss the row if it's an excluded set.
+      // Mirror the Sets list filter: drop cards whose set shortcode starts
+      // with a capital letter (card ids are `<setId>-<localId>`).
       const items = raw.filter((c) => !/^[A-Z]/.test(c.id));
-      // `fetched` is the RAW page size from TCGdex (pre-filter). Use it for
-      // pagination so getNextPageParam doesn't stop early just because the
-      // filter removed enough rows to drop the visible page below 60.
+      // `fetched` is the raw pre-filter page size; pagination uses it so
+      // filtering can't end paging early.
       return { items, fetched: raw.length };
     },
-    // Short page = we've reached the end. TCGdex returns at most
-    // SEARCH_ITEMS_PER_PAGE rows per page; anything less means no next page.
+    // A page shorter than SEARCH_ITEMS_PER_PAGE means no next page.
     getNextPageParam: (lastPage, _allPages, lastPageParam) =>
       lastPage.fetched === SEARCH_ITEMS_PER_PAGE ? lastPageParam + 1 : undefined,
     placeholderData: keepPreviousData,
@@ -726,9 +710,26 @@ export function useTcgCard(cardId: string | undefined, locale: Locale = 'en') {
   });
 }
 
+/** Warm the card-detail cache and hero image before pushing /card/[id],
+ *  so the screen mounts cache-hit. Fire-and-forget. */
+export function usePrefetchCard() {
+  const qc = useQueryClient();
+  return useCallback((cardId: string, locale: Locale = 'en') => {
+    qc.fetchQuery({
+      queryKey: [...KEY.card(cardId), locale],
+      queryFn: () => getCard(cardId, locale),
+      staleTime: 1000 * 60 * 30,
+    })
+      .then((card) => {
+        // Native image caches serve this instantly when the hero mounts.
+        if (card.images.large) Image.prefetch(card.images.large).catch(() => {});
+      })
+      .catch(() => {});
+  }, [qc]);
+}
+
 /** Resolves the Cardmarket product URL via the cardmarket-resolve Edge
- *  Function. The result is cached for the session (per card id) — first
- *  view costs one round-trip, subsequent taps are instant. */
+ *  Function; cached per card id for the session. */
 export function useCardmarketUrl(card: TcgCard | undefined) {
   return useQuery({
     queryKey: ['cardmarket-url', card?.id],
@@ -769,9 +770,8 @@ export interface ScanResult {
   locale?: 'en' | 'ja';
 }
 
-/** Send a base64 photo to the card-scan Edge Function and get ranked
- *  candidate cards back. A mutation (not a query) because each scan is a
- *  discrete user action with a fresh image — nothing to cache by key. */
+/** Send a base64 photo to the card-scan Edge Function; returns ranked
+ *  candidates. */
 export function useScanCard() {
   return useMutation({
     mutationFn: async (imageBase64: string): Promise<ScanResult> => {
@@ -785,24 +785,56 @@ export function useScanCard() {
   });
 }
 
-/** Cached list of every TCGdex set. Locale-plumbing for JP is in place
- *  (sets carry an optional `locale` tag) but JP fetching is disabled for
- *  now while TCGdex's JP data has duplicate rows. Flip the comment to
- *  re-enable. */
-export function useSets() {
+export type SetsScope = 'en' | 'intl';
+
+/** All TCGdex sets for a scope: 'en' or the intl catalogues, tagged with
+ *  `locale`. TCGdex ships duplicate rows, so lists are deduped by set id. */
+export function useSets(scope: SetsScope = 'en') {
   return useQuery<TcgdexSet[]>({
-    queryKey: KEY.sets,
+    queryKey: ['sets', scope],
     queryFn: async () => {
-      const en = await getSets('en');
-      return en.map((x) => ({ ...x, locale: 'en' as const }));
+      if (scope === 'en') {
+        const en = await getSets('en');
+        return en.map((x) => ({ ...x, locale: 'en' as const }));
+      }
+      const lists = await Promise.all(
+        INTL_LOCALES.map(async (loc) => {
+          try {
+            const sets = await getSets(loc);
+            const seen = new Set<string>();
+            const deduped = sets.filter(
+              (s) => (seen.has(s.id) ? false : (seen.add(s.id), true)),
+            );
+            // TCGdex lists metadata for intl sets with no cards entered; keep
+            // only sets the card index covers, or everything if it won't fetch.
+            let hasCards: (setId: string) => boolean = () => true;
+            try {
+              const ids = await getAllCardIds(loc);
+              const prefixes = new Set(
+                ids.map((id) => id.slice(0, id.lastIndexOf('-'))).filter(Boolean),
+              );
+              hasCards = (setId) =>
+                prefixes.has(setId) || ids.some((id) => id.startsWith(`${setId}-`));
+            } catch {
+              // Index unavailable; don't filter.
+            }
+            return deduped
+              .filter((s) => hasCards(s.id))
+              .map((x) => ({ ...x, locale: loc }));
+          } catch {
+            // One locale being down shouldn't blank the whole tab.
+            return [] as TcgdexSet[];
+          }
+        }),
+      );
+      return lists.flat();
     },
     staleTime: 1000 * 60 * 60 * 24,
   });
 }
 
-/** Full set with card list. Used by the Sets tab. `locale` defaults to
- *  'en' — pass 'ja' for Japanese sets. The query key includes locale so
- *  EN and JP variants don't clobber each other in the cache. */
+/** Full set with card list. The query key includes locale so EN and JP
+ *  variants don't clobber each other in the cache. */
 export function useSet(setId: string | undefined, locale: Locale = 'en') {
   return useQuery<TcgdexSetDetail>({
     queryKey: ['set', locale, setId],
@@ -818,8 +850,8 @@ export type { TcgdexBrief, TcgdexSet };
 // Profiles + sharing
 // ─────────────────────────────────────────────────────────────
 
-/** Current user's profile row. Auto-created by an auth trigger, but
- *  `username` starts as null until the user picks one. */
+/** Signed-in user's profile row. Auto-created by an auth trigger;
+ *  `username` starts null. */
 export function useMyProfile() {
   return useQuery<Profile | null>({
     queryKey: ['profile', 'me'],
@@ -838,9 +870,8 @@ export function useMyProfile() {
   });
 }
 
-/** Set / change the current user's username. Lowercase a-z, 0-9, _-, 3-24 chars.
- *  Upserts so users whose profile row was never created (auth-trigger miss,
- *  legacy imports) still succeed instead of silently no-op'ing an UPDATE. */
+/** Set or change the username (lowercase a-z, 0-9, _-, 3-24 chars).
+ *  Upserts so a missing profile row still succeeds. */
 export function useSetUsername() {
   const qc = useQueryClient();
   return useMutation({
@@ -863,7 +894,7 @@ export function useSetUsername() {
   });
 }
 
-/** Find another user's profile by username — used by /u/[username] routes. */
+/** Profile lookup by username; used by /u/[username] routes. */
 export function useProfileByUsername(username: string | undefined) {
   return useQuery<Profile | null>({
     queryKey: ['profile', 'username', username],
@@ -916,11 +947,13 @@ export function usePublicProfile(username: string | undefined) {
         .maybeSingle();
       if (pErr) throw pErr;
       if (!profile) return { profile: null as Profile | null, binders: [] as Binder[] };
+      // RLS hides friends-only binders from strangers, so a friend sees
+      // public + friends and a stranger sees only public.
       const { data: binders, error: bErr } = await supabase
         .from('binders')
         .select('*')
         .eq('user_id', profile.user_id)
-        .eq('visibility', 'public')
+        .neq('visibility', 'private')
         .order('created_at', { ascending: false });
       if (bErr) throw bErr;
       return { profile: profile as Profile, binders: (binders ?? []) as Binder[] };
@@ -929,9 +962,8 @@ export function usePublicProfile(username: string | undefined) {
   });
 }
 
-/** Read-only fetch of a binder for /u/[username]/binder/[id]. Returns the
- *  binder + its pages + every card, in one bundle. RLS lets us read all
- *  this because the binder's visibility is non-private. */
+/** Binder + pages + cards in one bundle for public viewing; readable via
+ *  RLS when the binder's visibility is non-private. */
 async function fetchPublicBinderBundle(binderId: string) {
   const { data: binder, error: bErr } = await supabase
     .from('binders')
@@ -955,7 +987,7 @@ async function fetchPublicBinderBundle(binderId: string) {
   return {
     binder: binder as Binder,
     pages: (pages ?? []) as BinderPage[],
-    cards: (cards ?? []) as CollectionRow[],
+    cards: ((cards ?? []) as CollectionRow[]).map(healRowImages),
   };
 }
 
@@ -974,17 +1006,302 @@ export function useBinderByShareToken(token: string | undefined) {
     queryKey: ['binder-by-token', token],
     enabled: !!token,
     queryFn: async () => {
+      // Share links resolve only for public binders; the visibility trigger
+      // strips share_token on non-public rows.
       const { data: binder, error } = await supabase
         .from('binders')
         .select('*')
         .eq('share_token', token!)
-        .neq('visibility', 'private')
+        .eq('visibility', 'public')
         .maybeSingle();
       if (error) throw error;
       if (!binder) return null;
       return fetchPublicBinderBundle(binder.id);
     },
     staleTime: 1000 * 60,
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
+// Friends — one cached row query (`friendships.mine`); derived views
+// are pure; mutations write optimistically into that cache.
+// ─────────────────────────────────────────────────────────────
+
+const FRIENDSHIPS_KEY = ['friendships', 'mine'] as const;
+
+/** Cached auth user id; lets derived hooks stay synchronous. */
+function useAuthUserId() {
+  return useQuery<string | null>({
+    queryKey: ['auth-user-id'],
+    queryFn: async () => (await supabase.auth.getUser()).data.user?.id ?? null,
+    staleTime: 1000 * 60 * 10,
+  });
+}
+
+/** All friendship rows the signed-in user is party to, both directions
+ *  and statuses. Source cache for the derived hooks. */
+function useMyFriendships() {
+  return useQuery<Friendship[]>({
+    queryKey: FRIENDSHIPS_KEY,
+    queryFn: async () => {
+      const { data: u } = await supabase.auth.getUser();
+      if (!u.user) return [];
+      const { data, error } = await supabase
+        .from('friendships')
+        .select('*')
+        .or(`requester_id.eq.${u.user.id},receiver_id.eq.${u.user.id}`)
+        .order('created_at', { ascending: false });
+      if (error) throw error;
+      return (data ?? []) as Friendship[];
+    },
+    staleTime: 1000 * 30,
+  });
+}
+
+async function fetchProfilesByIds(userIds: string[]): Promise<Profile[]> {
+  if (userIds.length === 0) return [];
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('*')
+    .in('user_id', userIds);
+  if (error) throw error;
+  return (data ?? []) as Profile[];
+}
+
+/** Batched profile fetch for the other party of each friendship. Sorted-id
+ *  key plus keepPreviousData keeps the list from flickering empty. */
+function useFriendProfiles() {
+  const { data: rows = [] } = useMyFriendships();
+  const { data: myId } = useAuthUserId();
+  const otherIds = (() => {
+    if (!myId) return [] as string[];
+    const set = new Set<string>();
+    for (const r of rows) {
+      set.add(r.requester_id === myId ? r.receiver_id : r.requester_id);
+    }
+    return Array.from(set);
+  })();
+  const sortedKey = [...otherIds].sort().join(',');
+  return useQuery<Profile[]>({
+    queryKey: ['friendships', 'profiles', sortedKey],
+    enabled: otherIds.length > 0,
+    queryFn: () => fetchProfilesByIds(otherIds),
+    placeholderData: keepPreviousData,
+    staleTime: 1000 * 60 * 5,
+  });
+}
+
+interface FriendListEntry {
+  friendship: Friendship;
+  profile: Profile;
+}
+
+/** Accepted friends, derived from the cached rows and profiles. */
+export function useFriends(): { data: FriendListEntry[]; isLoading: boolean } {
+  const myships = useMyFriendships();
+  const profiles = useFriendProfiles();
+  const { data: myId } = useAuthUserId();
+  const data: FriendListEntry[] = (() => {
+    if (!myId) return [];
+    const byId = new Map((profiles.data ?? []).map((p) => [p.user_id, p]));
+    return (myships.data ?? [])
+      .filter((r) => r.status === 'accepted')
+      .map((f) => {
+        const otherId = f.requester_id === myId ? f.receiver_id : f.requester_id;
+        const profile = byId.get(otherId);
+        return profile ? { friendship: f, profile } : null;
+      })
+      .filter((x): x is FriendListEntry => !!x);
+  })();
+  return { data, isLoading: myships.isLoading || profiles.isLoading };
+}
+
+/** Pending requests received by the signed-in user. */
+export function useIncomingRequests(): { data: FriendListEntry[]; isLoading: boolean } {
+  const myships = useMyFriendships();
+  const profiles = useFriendProfiles();
+  const { data: myId } = useAuthUserId();
+  const data: FriendListEntry[] = (() => {
+    if (!myId) return [];
+    const byId = new Map((profiles.data ?? []).map((p) => [p.user_id, p]));
+    return (myships.data ?? [])
+      .filter((r) => r.status === 'pending' && r.receiver_id === myId)
+      .map((f) => {
+        const profile = byId.get(f.requester_id);
+        return profile ? { friendship: f, profile } : null;
+      })
+      .filter((x): x is FriendListEntry => !!x);
+  })();
+  return { data, isLoading: myships.isLoading || profiles.isLoading };
+}
+
+/** Pending requests sent by the signed-in user; the profile is the receiver. */
+export function useOutgoingRequests(): { data: FriendListEntry[]; isLoading: boolean } {
+  const myships = useMyFriendships();
+  const profiles = useFriendProfiles();
+  const { data: myId } = useAuthUserId();
+  const data: FriendListEntry[] = (() => {
+    if (!myId) return [];
+    const byId = new Map((profiles.data ?? []).map((p) => [p.user_id, p]));
+    return (myships.data ?? [])
+      .filter((r) => r.status === 'pending' && r.requester_id === myId)
+      .map((f) => {
+        const profile = byId.get(f.receiver_id);
+        return profile ? { friendship: f, profile } : null;
+      })
+      .filter((x): x is FriendListEntry => !!x);
+  })();
+  return { data, isLoading: myships.isLoading || profiles.isLoading };
+}
+
+/** Relationship state with another user. Pure derivation, so optimistic
+ *  cache changes flip the Friend button instantly. */
+export function useFriendshipWith(otherUserId: string | undefined): {
+  data: { state: FriendState; row: Friendship | null } | undefined;
+} {
+  const { data: rows = [] } = useMyFriendships();
+  const { data: myId } = useAuthUserId();
+  if (!otherUserId || myId === undefined) return { data: undefined };
+  if (myId === otherUserId) return { data: { state: 'self', row: null } };
+  if (!myId) return { data: { state: 'none', row: null } };
+  const match = rows.find(
+    (r) =>
+      (r.requester_id === myId && r.receiver_id === otherUserId) ||
+      (r.requester_id === otherUserId && r.receiver_id === myId),
+  );
+  if (!match) return { data: { state: 'none', row: null } };
+  if (match.status === 'accepted') return { data: { state: 'friends', row: match } };
+  const state: FriendState =
+    match.requester_id === myId ? 'outgoing-pending' : 'incoming-pending';
+  return { data: { state, row: match } };
+}
+
+/** Invalidate everything gated on friend visibility. Runs after a mutation
+ *  settles; the optimistic onMutate flip handles immediacy. */
+function refetchFriendDependents(qc: ReturnType<typeof useQueryClient>) {
+  qc.invalidateQueries({ queryKey: FRIENDSHIPS_KEY });
+  qc.invalidateQueries({ queryKey: ['public-profile'] });
+  qc.invalidateQueries({ queryKey: ['public-binder'] });
+  qc.invalidateQueries({ queryKey: KEY.binders });
+  qc.invalidateQueries({ queryKey: KEY.collection });
+}
+
+/** Send a friend request. Optimistically inserts a pending row so the
+ *  Friend button flips immediately. */
+export function useSendFriendRequest() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (receiverId: string) => {
+      const { data: u } = await supabase.auth.getUser();
+      if (!u.user) throw new Error('Not signed in');
+      if (u.user.id === receiverId) throw new Error('Can\'t friend yourself');
+      const { error } = await supabase
+        .from('friendships')
+        .insert({ requester_id: u.user.id, receiver_id: receiverId });
+      if (error) {
+        if ((error as { code?: string }).code === '23505') {
+          throw new Error('Friend request already exists for this user.');
+        }
+        throw error;
+      }
+    },
+    onMutate: async (receiverId) => {
+      await qc.cancelQueries({ queryKey: FRIENDSHIPS_KEY });
+      const prev = qc.getQueryData<Friendship[]>(FRIENDSHIPS_KEY);
+      const myId = qc.getQueryData<string | null>(['auth-user-id']);
+      if (myId) {
+        const now = new Date().toISOString();
+        const optimistic: Friendship = {
+          id: `optimistic-${myId}-${receiverId}`,
+          requester_id: myId,
+          receiver_id: receiverId,
+          status: 'pending',
+          created_at: now,
+          updated_at: now,
+        };
+        qc.setQueryData<Friendship[]>(FRIENDSHIPS_KEY, [optimistic, ...(prev ?? [])]);
+      }
+      return { prev };
+    },
+    onError: (_e, _v, ctx) => {
+      if (ctx?.prev) qc.setQueryData(FRIENDSHIPS_KEY, ctx.prev);
+    },
+    onSettled: () => refetchFriendDependents(qc),
+  });
+}
+
+/** Accept an incoming request. Optimistic: flip status to 'accepted'
+ *  in cache so the button + lists update on tap. */
+export function useAcceptFriendRequest() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (friendshipId: string) => {
+      const { error } = await supabase
+        .from('friendships')
+        .update({ status: 'accepted' })
+        .eq('id', friendshipId);
+      if (error) throw error;
+    },
+    onMutate: async (friendshipId) => {
+      await qc.cancelQueries({ queryKey: FRIENDSHIPS_KEY });
+      const prev = qc.getQueryData<Friendship[]>(FRIENDSHIPS_KEY);
+      qc.setQueryData<Friendship[]>(FRIENDSHIPS_KEY, (rows) =>
+        rows?.map((r) =>
+          r.id === friendshipId
+            ? { ...r, status: 'accepted', updated_at: new Date().toISOString() }
+            : r,
+        ),
+      );
+      return { prev };
+    },
+    onError: (_e, _v, ctx) => {
+      if (ctx?.prev) qc.setQueryData(FRIENDSHIPS_KEY, ctx.prev);
+    },
+    onSettled: () => refetchFriendDependents(qc),
+  });
+}
+
+/** Delete a friendship row. Covers decline / cancel / unfriend. */
+export function useDeleteFriendship() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (friendshipId: string) => {
+      const { error } = await supabase
+        .from('friendships')
+        .delete()
+        .eq('id', friendshipId);
+      if (error) throw error;
+    },
+    onMutate: async (friendshipId) => {
+      await qc.cancelQueries({ queryKey: FRIENDSHIPS_KEY });
+      const prev = qc.getQueryData<Friendship[]>(FRIENDSHIPS_KEY);
+      qc.setQueryData<Friendship[]>(FRIENDSHIPS_KEY, (rows) =>
+        rows?.filter((r) => r.id !== friendshipId),
+      );
+      return { prev };
+    },
+    onError: (_e, _v, ctx) => {
+      if (ctx?.prev) qc.setQueryData(FRIENDSHIPS_KEY, ctx.prev);
+    },
+    onSettled: () => refetchFriendDependents(qc),
+  });
+}
+
+/** Resolve a username to a user_id. */
+export function useUserIdByUsername(username: string | undefined) {
+  return useQuery<string | null>({
+    queryKey: ['profile', 'id-by-username', username],
+    enabled: !!username,
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('user_id')
+        .eq('username', username!)
+        .maybeSingle();
+      if (error) throw error;
+      return data?.user_id ?? null;
+    },
+    staleTime: 1000 * 60 * 5,
   });
 }
 
@@ -1012,8 +1329,7 @@ export function useMoveCards() {
       if (posErr) throw posErr;
       const startPos = (last?.position ?? -1) + 1;
 
-      // Parallel updates, each with its own sequential position so we
-      // don't collide and so reading order is preserved at the target.
+      // Sequential positions avoid collisions and preserve reading order.
       const results = await Promise.all(
         rowIds.map((id, i) =>
           supabase
@@ -1025,15 +1341,12 @@ export function useMoveCards() {
       );
       for (const r of results) if (r.error) throw r.error;
       // Cards placed beyond the existing page count need new binder_pages
-      // rows or the page menu won't show them — same invariant useUpsertCard
-      // maintains. Without this, a move that crosses a page boundary leaves
-      // the cards "orphaned" with no rendered page above them.
+      // rows or the page menu won't show them.
       await ensureBinderHasSpace(targetBinderId);
       return { moved: rowIds.length, targetBinderId };
     },
     onSuccess: () => {
-      // Source AND target binder caches need refresh; cheapest to nuke
-      // anything binder/collection scoped.
+      // Both source and target binder caches need refreshing.
       qc.invalidateQueries({ queryKey: KEY.collection });
       qc.invalidateQueries({ queryKey: KEY.binders });
       qc.invalidateQueries({ queryKey: ['binder'] });
@@ -1070,8 +1383,7 @@ async function getOrCreateBulkBinder(userId: string): Promise<Binder> {
   return created as Binder;
 }
 
-/** Batch version — inserts many cards into the bulk binder in one round-trip.
- *  Used by the multi-select "Add to Bulk" action on the set detail screen. */
+/** Insert many cards into the bulk binder in one round-trip. */
 export function useMarkCardsOwned() {
   const qc = useQueryClient();
   return useMutation({
@@ -1099,21 +1411,24 @@ export function useMarkCardsOwned() {
       if (posErr) throw posErr;
       const startPos = (last?.position ?? -1) + 1;
 
-      const rows = cards.map((card, i) => ({
-        user_id: u.user!.id,
-        binder_id: bulk.id,
-        card_id: card.id,
-        card_name: card.name,
-        set_id: card.setId,
-        set_name: card.setName,
-        card_number: card.localId,
-        rarity: card.rarity ?? null,
-        image_small: card.image ? `${card.image}/low.webp` : null,
-        image_large: card.image ? `${card.image}/high.webp` : null,
-        status: 'have' as const,
-        condition: 'NM',
-        position: startPos + i,
-      }));
+      const rows = cards.map((card, i) => {
+        const img = cardImages(card.image, card.setId, card.localId);
+        return {
+          user_id: u.user!.id,
+          binder_id: bulk.id,
+          card_id: card.id,
+          card_name: card.name,
+          set_id: card.setId,
+          set_name: card.setName,
+          card_number: card.localId,
+          rarity: card.rarity ?? null,
+          image_small: img.small || null,
+          image_large: img.large || null,
+          status: 'have' as const,
+          condition: 'NM',
+          position: startPos + i,
+        };
+      });
 
       const { error } = await supabase.from('collections').insert(rows);
       if (error) throw error;
@@ -1128,8 +1443,7 @@ export function useMarkCardsOwned() {
   });
 }
 
-/** Insert a card into the user's bulk binder. Used by the "I own this"
- *  button on the set detail screen — minimal card info from TCGdex brief. */
+/** Insert a single card into the bulk binder. */
 export function useMarkCardOwned() {
   const qc = useQueryClient();
   return useMutation({
@@ -1146,7 +1460,6 @@ export function useMarkCardOwned() {
       if (!u.user) throw new Error('Sign in to mark as owned');
       const bulk = await getOrCreateBulkBinder(u.user.id);
 
-      // Append to bulk binder at the next free position.
       const { data: last, error: posErr } = await supabase
         .from('collections')
         .select('position')
@@ -1157,8 +1470,9 @@ export function useMarkCardOwned() {
       if (posErr) throw posErr;
       const nextPos = (last?.position ?? -1) + 1;
 
-      const imageSmall = card.image ? `${card.image}/low.webp` : null;
-      const imageLarge = card.image ? `${card.image}/high.webp` : null;
+      const img = cardImages(card.image, card.setId, card.localId);
+      const imageSmall = img.small || null;
+      const imageLarge = img.large || null;
       const { error } = await supabase
         .from('collections')
         .insert({
@@ -1211,7 +1525,7 @@ export function useMasteringSets() {
   });
 }
 
-/** Add / remove a set from the user's mastering list. */
+/** Add or remove a set from the mastering list. */
 export function useToggleMastering() {
   const qc = useQueryClient();
   return useMutation({
@@ -1252,10 +1566,277 @@ export function useToggleMastering() {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Master-set variants — which printings exist per card, and per-variant
+// ownership check-offs. Mirrors the card_meta pattern: memory cache →
+// shared card_variants table → TCGdex (throttled), with write-back.
+// ─────────────────────────────────────────────────────────────
+
+const variantsMemCache = new Map<string, CardVariantsInfo>();
+const VARIANTS_CONCURRENCY = 6;
+
+interface SetVariantsState {
+  /** null while resolution is running. */
+  variants: Map<string, CardVariantsInfo> | null;
+  /** Non-null only while cards are being fetched from TCGdex. */
+  progress: { done: number; total: number } | null;
+  error: string | null;
+}
+
+/** Resolve variant info for a list of card ids. An empty list keeps the
+ *  hook dormant, so browsing a set doesn't trigger hundreds of fetches. */
+export function useSetVariants(cardIds: string[], locale: Locale = 'en'): SetVariantsState {
+  // `forKey` pins the state to the id list it was computed for; without it a
+  // level switch briefly exposes the previous request's map and the grid flashes.
+  const [state, setState] = useState<SetVariantsState & { forKey: string }>({
+    forKey: '', variants: null, progress: null, error: null,
+  });
+  const key = useMemo(() => [...new Set(cardIds)].sort().join(','), [cardIds]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const ids = key ? key.split(',') : [];
+    if (ids.length === 0) {
+      setState({ forKey: key, variants: new Map(), progress: null, error: null });
+      return;
+    }
+    setState({ forKey: key, variants: null, progress: null, error: null });
+
+    (async () => {
+      try {
+        const out = new Map<string, CardVariantsInfo>();
+        let missing: string[] = [];
+        for (const id of ids) {
+          const hit = variantsMemCache.get(id);
+          if (hit) out.set(id, hit);
+          else missing.push(id);
+        }
+
+        // Shared cache lookup, chunked to keep the .in() URL reasonable.
+        // Best-effort: on failure, anything still missing fetches from TCGdex.
+        if (missing.length) {
+          try {
+            const stillMissing: string[] = [];
+            for (let i = 0; i < missing.length; i += DB_CHUNK) {
+              const chunk = missing.slice(i, i + DB_CHUNK);
+              const { data, error } = await supabase
+                .from('card_variants')
+                .select('card_id,variants,variants_detailed')
+                .in('card_id', chunk);
+              if (error) throw error;
+              const found = new Set<string>();
+              for (const row of (data ?? []) as CardVariantsInfo[]) {
+                out.set(row.card_id, row);
+                variantsMemCache.set(row.card_id, row);
+                found.add(row.card_id);
+              }
+              for (const id of chunk) if (!found.has(id)) stillMissing.push(id);
+            }
+            missing = stillMissing;
+          } catch {
+            missing = missing.filter((id) => !out.has(id));
+          }
+        }
+
+        // Cold path: TCGdex, a few at a time, with live progress.
+        if (missing.length) {
+          let done = 0;
+          if (!cancelled) setState({ forKey: key, variants: null, progress: { done, total: missing.length }, error: null });
+          const fetched: CardVariantsInfo[] = [];
+          let next = 0;
+          const worker = async () => {
+            while (next < missing.length && !cancelled) {
+              const id = missing[next++];
+              try {
+                const info = await getCardVariants(id, locale);
+                fetched.push(info);
+                out.set(id, info);
+                variantsMemCache.set(id, info);
+              } catch {
+                // Transient failure: usable this session but not persisted,
+                // so the next run retries instead of caching a false miss.
+                out.set(id, { card_id: id, variants: null, variants_detailed: null });
+              }
+              done++;
+              if (!cancelled) setState({ forKey: key, variants: null, progress: { done, total: missing.length }, error: null });
+            }
+          };
+          await Promise.all(
+            Array.from({ length: Math.min(VARIANTS_CONCURRENCY, missing.length) }, worker),
+          );
+
+          // Best-effort write-back; the grid must still work when the
+          // shared cache can't be written.
+          try {
+            for (let i = 0; i < fetched.length; i += DB_CHUNK) {
+              const chunk = fetched.slice(i, i + DB_CHUNK);
+              await supabase.from('card_variants').upsert(chunk, { onConflict: 'card_id' });
+            }
+          } catch {
+            // Next session re-fetches from TCGdex; nothing user-facing.
+          }
+        }
+
+        if (!cancelled) setState({ forKey: key, variants: out, progress: null, error: null });
+      } catch (e) {
+        if (!cancelled) {
+          setState({
+            forKey: key, variants: null, progress: null,
+            error: e instanceof Error ? e.message : 'Variant lookup failed',
+          });
+        }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [key, locale]);
+
+  if (state.forKey !== key) return { variants: null, progress: null, error: null };
+  return { variants: state.variants, progress: state.progress, error: state.error };
+}
+
+/** Checking on inserts one 'have' row into the bulk binder; checking off
+ *  deletes one matching row, preferring a bulk-binder copy so curated
+ *  binder layouts are never disturbed. */
+export function useToggleVariantOwned() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      card, variantKey, owned, fallbackKeys,
+    }: {
+      card: {
+        id: string;
+        name: string;
+        localId: string;
+        image?: string;
+        rarity?: string;
+        setId: string;
+        setName: string;
+      };
+      variantKey: string;
+      owned: boolean; // desired state
+      /** Extra variant keys that also satisfy this slot; rows tagged 'normal'
+       *  can count toward the base printing of cards without a Normal printing. */
+      fallbackKeys?: string[];
+    }) => {
+      const { data: u } = await supabase.auth.getUser();
+      if (!u.user) throw new Error('Sign in to track variants');
+
+      if (owned) {
+        const bulk = await getOrCreateBulkBinder(u.user.id);
+        const { data: last, error: posErr } = await supabase
+          .from('collections')
+          .select('position')
+          .eq('binder_id', bulk.id)
+          .order('position', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (posErr) throw posErr;
+        const img = cardImages(card.image, card.setId, card.localId);
+        const { error } = await supabase.from('collections').insert({
+          user_id: u.user.id,
+          binder_id: bulk.id,
+          card_id: card.id,
+          card_name: card.name,
+          set_id: card.setId,
+          set_name: card.setName,
+          card_number: card.localId,
+          rarity: card.rarity ?? null,
+          image_small: img.small || null,
+          image_large: img.large || null,
+          status: 'have',
+          condition: 'NM',
+          variant: variantKey,
+          position: (last?.position ?? -1) + 1,
+        });
+        if (error) throw error;
+        return { binderId: bulk.id };
+      }
+
+      const searchKeys = [variantKey, ...(fallbackKeys ?? [])];
+      const { data: rows, error } = await supabase
+        .from('collections')
+        .select('id,binder_id,variant,added_at')
+        .eq('user_id', u.user.id)
+        .eq('card_id', card.id)
+        .in('variant', searchKeys)
+        .eq('status', 'have')
+        .order('added_at', { ascending: false });
+      if (error) throw error;
+      // Prefer an exact-variant row; use fallback keys only when the slot's
+      // own key has no rows left.
+      let candidates: NonNullable<typeof rows> = [];
+      for (const k of searchKeys) {
+        candidates = (rows ?? []).filter((r) => r.variant === k);
+        if (candidates.length) break;
+      }
+      if (!candidates.length) return { binderId: null };
+      const { data: bulk } = await supabase
+        .from('binders')
+        .select('id')
+        .eq('user_id', u.user.id)
+        .eq('is_bulk', true)
+        .maybeSingle();
+      const target = candidates.find((r) => r.binder_id === bulk?.id) ?? candidates[0];
+      const { error: dErr } = await supabase.from('collections').delete().eq('id', target.id);
+      if (dErr) throw dErr;
+      return { binderId: target.binder_id as string };
+    },
+    onMutate: async ({ card, variantKey, owned, fallbackKeys }) => {
+      // Optimistic flip in the collection cache; the checklist derives
+      // ownership from these rows.
+      await qc.cancelQueries({ queryKey: KEY.collection });
+      const prev = qc.getQueryData<CollectionRow[]>(KEY.collection);
+      if (prev) {
+        if (owned) {
+          const img = cardImages(card.image, card.setId, card.localId);
+          const now = new Date().toISOString();
+          const optimistic: CollectionRow = {
+            id: `optimistic-${card.id}-${variantKey}-${Date.now()}`,
+            user_id: '', binder_id: '',
+            card_id: card.id, card_name: card.name,
+            set_id: card.setId, set_name: card.setName,
+            card_number: card.localId,
+            rarity: card.rarity ?? null, card_type: null,
+            image_small: img.small || null, image_large: img.large || null,
+            status: 'have', quantity: 1, condition: 'NM',
+            variant: variantKey, notes: null,
+            last_price_eur: null, price_checked_at: null,
+            position: 0, added_at: now, updated_at: now,
+          };
+          qc.setQueryData<CollectionRow[]>(KEY.collection, [optimistic, ...prev]);
+        } else {
+          let idx = -1;
+          for (const k of [variantKey, ...(fallbackKeys ?? [])]) {
+            idx = prev.findIndex(
+              (r) => r.card_id === card.id
+                && (r.variant ?? 'normal') === k
+                && r.status === 'have',
+            );
+            if (idx >= 0) break;
+          }
+          if (idx >= 0) {
+            qc.setQueryData<CollectionRow[]>(
+              KEY.collection,
+              [...prev.slice(0, idx), ...prev.slice(idx + 1)],
+            );
+          }
+        }
+      }
+      return { prev };
+    },
+    onError: (_e, _v, ctx) => {
+      if (ctx?.prev) qc.setQueryData(KEY.collection, ctx.prev);
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['collection'] });
+      qc.invalidateQueries({ queryKey: KEY.binders });
+    },
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
 // Copy a page from a public binder into one of the signed-in user's
-// binders. Creates a new page at the end and inserts the source cards
-// at the matching positions; duplicates (same card_id already in the
-// target binder) are silently skipped via upsert+ignoreDuplicates.
+// binders as a new page at the end.
 // ─────────────────────────────────────────────────────────────
 export function useCopyPageToMyBinder() {
   const qc = useQueryClient();
@@ -1292,9 +1873,8 @@ export function useCopyPageToMyBinder() {
       if (pErr) throw pErr;
       const nextPageIdx = (lastPage?.page_index ?? -1) + 1;
 
-      // Re-flow the source cards into target-sized pages, reading order
-      // preserved (left-to-right, top-to-bottom). When the source grid is
-      // larger than the target's, the page spills into additional new pages.
+      // Re-flow the source cards into target-sized pages, preserving reading
+      // order; a larger source grid spills into additional pages.
       const ordered = [...sourceCards].sort((a, b) => a.position - b.position);
       const pagesNeeded = Math.max(1, Math.ceil(ordered.length / slotsPerPage));
       const newPageRows = Array.from({ length: pagesNeeded }, (_, i) => ({
@@ -1323,15 +1903,14 @@ export function useCopyPageToMyBinder() {
           image_large: c.image_large,
           status,
           condition: 'NM',
+          ...(c.variant != null ? { variant: c.variant } : {}),
           last_price_eur: c.last_price_eur,
           price_checked_at: c.price_checked_at,
           position: (nextPageIdx + pageOffset) * slotsPerPage + localPos,
         };
       });
 
-      // Plain insert — duplicates are allowed (per_instance_migration drops
-      // the (user_id, binder_id, card_id) unique constraint), so the same
-      // card can sit in multiple slots of the same binder.
+      // Duplicates are allowed; the same card can sit in multiple slots.
       let inserted = 0;
       if (rows.length > 0) {
         const { data, error } = await supabase
@@ -1358,13 +1937,151 @@ export function useCopyPageToMyBinder() {
   });
 }
 
+/** Clone an owned binder: same grid, pages, and cards with fields preserved.
+ *  The bulk binder is a per-user singleton and can't be duplicated. */
+export function useDuplicateBinder() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (binderId: string): Promise<Binder> => {
+      const { data: u } = await supabase.auth.getUser();
+      if (!u.user) throw new Error('Not signed in');
+
+      const [srcRes, pagesRes, cardsRes] = await Promise.all([
+        supabase.from('binders').select('*').eq('id', binderId).eq('user_id', u.user.id).maybeSingle(),
+        supabase.from('binder_pages').select('*').eq('binder_id', binderId).order('page_index'),
+        supabase.from('collections').select('*').eq('binder_id', binderId).eq('user_id', u.user.id).order('position'),
+      ]);
+      if (srcRes.error) throw srcRes.error;
+      if (!srcRes.data) throw new Error('Binder not found');
+      if (pagesRes.error) throw pagesRes.error;
+      if (cardsRes.error) throw cardsRes.error;
+      const src = srcRes.data as Binder;
+      if (src.is_bulk) throw new Error('The bulk binder can\'t be duplicated.');
+
+      const { data: dup, error: bErr } = await supabase
+        .from('binders')
+        .insert({
+          user_id: u.user.id,
+          name: `${src.name} (copy)`,
+          grid_cols: src.grid_cols,
+          grid_rows: src.grid_rows,
+        })
+        .select()
+        .single();
+      if (bErr) throw bErr;
+
+      const pages = (pagesRes.data ?? []) as BinderPage[];
+      const pageRows = (pages.length > 0 ? pages : [{ page_index: 0, title: null }])
+        .map((p) => ({ binder_id: dup.id, page_index: p.page_index, title: p.title }));
+      const { error: pErr } = await supabase.from('binder_pages').insert(pageRows);
+      if (pErr) throw pErr;
+
+      const cards = (cardsRes.data ?? []) as CollectionRow[];
+      if (cards.length > 0) {
+        const cardRows = cards.map((c) => ({
+          user_id: u.user!.id,
+          binder_id: dup.id,
+          card_id: c.card_id,
+          card_name: c.card_name,
+          set_id: c.set_id,
+          set_name: c.set_name,
+          card_number: c.card_number,
+          rarity: c.rarity,
+          card_type: c.card_type,
+          image_small: c.image_small,
+          image_large: c.image_large,
+          status: c.status,
+          condition: c.condition,
+          quantity: c.quantity,
+          ...(c.variant != null ? { variant: c.variant } : {}),
+          notes: c.notes,
+          last_price_eur: c.last_price_eur,
+          price_checked_at: c.price_checked_at,
+          position: c.position,
+        }));
+        const { error: cErr } = await supabase.from('collections').insert(cardRows);
+        if (cErr) throw cErr;
+      }
+      return dup as Binder;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: KEY.binders });
+      qc.invalidateQueries({ queryKey: KEY.collection });
+    },
+  });
+}
+
+/** Copy rows into a target binder as new rows at the end, preserving their
+ *  fields. Source rows stay in place. */
+export function useCopyCards() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      rowIds, targetBinderId,
+    }: { rowIds: string[]; targetBinderId: string }) => {
+      if (rowIds.length === 0) return { copied: 0, targetBinderId };
+      const { data: u } = await supabase.auth.getUser();
+      if (!u.user) throw new Error('Not signed in');
+
+      const { data: src, error: srcErr } = await supabase
+        .from('collections')
+        .select('*')
+        .in('id', rowIds)
+        .eq('user_id', u.user.id)
+        .order('position');
+      if (srcErr) throw srcErr;
+      const sources = (src ?? []) as CollectionRow[];
+
+      const { data: last, error: posErr } = await supabase
+        .from('collections')
+        .select('position')
+        .eq('binder_id', targetBinderId)
+        .order('position', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (posErr) throw posErr;
+      const startPos = (last?.position ?? -1) + 1;
+
+      const rows = sources.map((c, i) => ({
+        user_id: u.user!.id,
+        binder_id: targetBinderId,
+        card_id: c.card_id,
+        card_name: c.card_name,
+        set_id: c.set_id,
+        set_name: c.set_name,
+        card_number: c.card_number,
+        rarity: c.rarity,
+        card_type: c.card_type,
+        image_small: c.image_small,
+        image_large: c.image_large,
+        status: c.status,
+        condition: c.condition,
+        quantity: c.quantity,
+        ...(c.variant != null ? { variant: c.variant } : {}),
+        notes: c.notes,
+        last_price_eur: c.last_price_eur,
+        price_checked_at: c.price_checked_at,
+        position: startPos + i,
+      }));
+      const { error } = await supabase.from('collections').insert(rows);
+      if (error) throw error;
+      await ensureBinderHasSpace(targetBinderId);
+      return { copied: rows.length, targetBinderId };
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: KEY.collection });
+      qc.invalidateQueries({ queryKey: KEY.binders });
+      qc.invalidateQueries({ queryKey: ['binder'] });
+      qc.invalidateQueries({ queryKey: ['collection', 'binder'] });
+    },
+  });
+}
+
 // ─────────────────────────────────────────────────────────────
 // .pkbinder export / import
 // ─────────────────────────────────────────────────────────────
 
-/** Build a .pkbinder JSON string for a binder the user owns. Fetches
- *  the binder, its pages, and every card row in one go — the same shape
- *  fetchPublicBinderBundle returns, but scoped to the signed-in user. */
+/** Build a .pkbinder JSON string for an owned binder: binder + pages + cards. */
 export function useExportBinder() {
   return useMutation({
     mutationFn: async (binderId: string): Promise<{
@@ -1396,8 +2113,7 @@ export function useExportBinder() {
 }
 
 /** Recreate a binder from a parsed .pkbinder payload. Always creates a
- *  fresh binder owned by the signed-in user — no merge into an existing
- *  one (sidesteps name/position conflict questions entirely). */
+ *  fresh binder; never merges into an existing one. */
 export function useImportBinder() {
   const qc = useQueryClient();
   return useMutation({
@@ -1419,6 +2135,7 @@ export function useImportBinder() {
         status: Status;
         condition: string;
         quantity: number;
+        variant?: string | null;
         notes: string | null;
         position: number;
       }>;
@@ -1438,10 +2155,8 @@ export function useImportBinder() {
         .single();
       if (bErr) throw bErr;
 
-      // Pages: take the longer of (file pages, pages implied by max card
-      // position) so every card has a page row above it. Otherwise a file
-      // missing trailing empty pages would leave cards "orphaned" in the
-      // grid until ensureBinderHasSpace runs.
+      // Take the longer of file pages and pages implied by max card position,
+      // so every card has a page row above it.
       const slotsPerPage = payload.cols * payload.rows;
       const maxPos = payload.cards.reduce((m, c) => Math.max(m, c.position), -1);
       const cardPages = maxPos >= 0 ? Math.floor(maxPos / slotsPerPage) + 1 : 0;
@@ -1470,6 +2185,7 @@ export function useImportBinder() {
           status: c.status,
           condition: c.condition,
           quantity: c.quantity,
+          ...(c.variant != null ? { variant: c.variant } : {}),
           notes: c.notes,
           position: c.position,
         }));
@@ -1492,8 +2208,7 @@ export function useImportBinder() {
 // Likes
 // ─────────────────────────────────────────────────────────────
 
-/** Whether the signed-in user has liked a given binder. Returns false
- *  when not signed in (unauth viewers see counts but can't like). */
+/** Whether the signed-in user has liked a binder; false when signed out. */
 export function useDidILikeBinder(binderId: string | undefined) {
   return useQuery<boolean>({
     queryKey: ['liked-binder', binderId],
@@ -1570,6 +2285,398 @@ export function useToggleLike() {
     },
     onSettled: () => {
       qc.invalidateQueries({ queryKey: ['public-profile'] });
+    },
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
+// Curator — card-facts enrichment + applying page ideas
+// ─────────────────────────────────────────────────────────────
+
+/** Session-wide facts cache so revisiting the ideas screen is instant. */
+const factsMemCache = new Map<string, CardFacts>();
+const ENRICH_CONCURRENCY = 4;
+const DB_CHUNK = 150;
+
+interface CardFactsState {
+  /** null while enrichment is running. */
+  facts: Map<string, CardFacts> | null;
+  /** Non-null only while cards are being fetched from TCGdex. */
+  progress: { done: number; total: number } | null;
+  error: string | null;
+}
+
+/** Resolve CardFacts for card ids: memory, then the shared card_meta table,
+ *  then TCGdex, with write-back so each card is fetched once globally. */
+export function useCardFacts(cardIds: string[]): CardFactsState {
+  const [state, setState] = useState<CardFactsState>({ facts: null, progress: null, error: null });
+  const key = useMemo(() => [...new Set(cardIds)].sort().join(','), [cardIds]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const ids = key ? key.split(',') : [];
+    if (ids.length === 0) {
+      setState({ facts: new Map(), progress: null, error: null });
+      return;
+    }
+    setState({ facts: null, progress: null, error: null });
+
+    (async () => {
+      try {
+        const out = new Map<string, CardFacts>();
+        let missing: string[] = [];
+        for (const id of ids) {
+          const hit = factsMemCache.get(id);
+          if (hit) out.set(id, hit);
+          else missing.push(id);
+        }
+
+        // Shared cache lookup, chunked to keep the .in() URL reasonable.
+        if (missing.length) {
+          const stillMissing: string[] = [];
+          for (let i = 0; i < missing.length; i += DB_CHUNK) {
+            const chunk = missing.slice(i, i + DB_CHUNK);
+            const { data, error } = await supabase
+              .from('card_meta')
+              .select('card_id,category,dex_ids,stage,evolve_from,illustrator,palette')
+              .in('card_id', chunk);
+            if (error) throw error;
+            const found = new Set<string>();
+            for (const row of (data ?? []) as CardFacts[]) {
+              out.set(row.card_id, row);
+              factsMemCache.set(row.card_id, row);
+              found.add(row.card_id);
+            }
+            for (const id of chunk) if (!found.has(id)) stillMissing.push(id);
+          }
+          missing = stillMissing;
+        }
+
+        // Cold path: TCGdex, a few at a time, with live progress.
+        if (missing.length) {
+          let done = 0;
+          if (!cancelled) setState({ facts: null, progress: { done, total: missing.length }, error: null });
+          const fetched: CardFacts[] = [];
+          let next = 0;
+          const worker = async () => {
+            while (next < missing.length && !cancelled) {
+              const id = missing[next++];
+              try {
+                const facts = await getCardFacts(id);
+                fetched.push(facts);
+                out.set(id, facts);
+                factsMemCache.set(id, facts);
+              } catch {
+                // Transient failure: usable this session but not persisted,
+                // so the next run retries instead of caching a false miss.
+                const blank: CardFacts = {
+                  card_id: id, category: null, dex_ids: null,
+                  stage: null, evolve_from: null, illustrator: null, palette: null,
+                };
+                out.set(id, blank);
+              }
+              done++;
+              if (!cancelled) setState({ facts: null, progress: { done, total: missing.length }, error: null });
+            }
+          };
+          await Promise.all(
+            Array.from({ length: Math.min(ENRICH_CONCURRENCY, missing.length) }, worker),
+          );
+
+          // Best-effort write-back; the ideas still render if this fails.
+          for (let i = 0; i < fetched.length; i += DB_CHUNK) {
+            const chunk = fetched.slice(i, i + DB_CHUNK);
+            await supabase.from('card_meta').upsert(chunk, { onConflict: 'card_id' });
+          }
+        }
+
+        if (!cancelled) setState({ facts: out, progress: null, error: null });
+      } catch (e) {
+        if (!cancelled) {
+          setState({
+            facts: null, progress: null,
+            error: e instanceof Error ? e.message : 'Enrichment failed',
+          });
+        }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [key]);
+
+  return state;
+}
+
+/** Batch size for the card-palette Edge Function (its own cap is 30). */
+const PALETTE_CHUNK = 25;
+
+/** For cards whose facts lack a palette, the card-palette Edge Function
+ *  extracts one and persists it to card_meta. Pass null while facts load. */
+export function useCardPalettes(
+  items: { card_id: string; image: string }[] | null,
+): { palettes: Map<string, PaletteEntry[]>; pending: number } {
+  const [state, setState] = useState<{
+    palettes: Map<string, PaletteEntry[]>;
+    pending: number;
+  }>({ palettes: new Map(), pending: 0 });
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const key = useMemo(
+    () => (items ? [...new Set(items.map((i) => i.card_id))].sort().join(',') : ''),
+    [items],
+  );
+
+  useEffect(() => {
+    if (!key) {
+      setState({ palettes: new Map(), pending: 0 });
+      return;
+    }
+    const wanted = new Set(key.split(','));
+    const seen = new Set<string>();
+    const list = (itemsRef.current ?? []).filter((i) => {
+      if (!wanted.has(i.card_id) || seen.has(i.card_id)) return false;
+      seen.add(i.card_id);
+      return true;
+    });
+    let cancelled = false;
+    setState({ palettes: new Map(), pending: list.length });
+
+    (async () => {
+      const out = new Map<string, PaletteEntry[]>();
+      for (let i = 0; i < list.length; i += PALETTE_CHUNK) {
+        if (cancelled) return;
+        const chunk = list.slice(i, i + PALETTE_CHUNK);
+        try {
+          const { data, error } = await supabase.functions.invoke('card-palette', {
+            body: { cards: chunk },
+          });
+          if (!error && data?.palettes) {
+            for (const [id, pal] of Object.entries(data.palettes as Record<string, PaletteEntry[]>)) {
+              out.set(id, pal);
+              const f = factsMemCache.get(id);
+              if (f) factsMemCache.set(id, { ...f, palette: pal });
+            }
+          }
+        } catch {
+          // Extraction is a nice-to-have; a failed chunk just means those
+          // cards sit out the colour archetypes this session.
+        }
+        if (!cancelled) {
+          setState({
+            palettes: new Map(out),
+            pending: Math.max(0, list.length - (i + chunk.length)),
+          });
+        }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [key]);
+
+  return state;
+}
+
+/** Session cache of panorama pair verdicts; -1 marks a pair whose
+ *  computation failed this session (retried next session, not this one). */
+const pairScoreMemCache = new Map<string, number>();
+const PAIR_CHUNK = 8;
+
+/** Resolve edge-continuity scores for candidate pairs: card_pairs table first,
+ *  then the card-panorama Edge Function. Pass null while ideas are generating. */
+export function useCardPairScores(
+  pairs: import('./curator').PanoramaPairReq[] | null,
+): { pairScores: Map<string, number>; pending: number } {
+  const [state, setState] = useState<{
+    pairScores: Map<string, number>;
+    pending: number;
+  }>({ pairScores: new Map(), pending: 0 });
+  const pairsRef = useRef(pairs);
+  pairsRef.current = pairs;
+  const key = useMemo(
+    () => (pairs?.length ? pairs.map((p) => p.key).sort().join(';') : ''),
+    [pairs],
+  );
+
+  useEffect(() => {
+    if (!key) return; // keep previously resolved scores visible
+    let cancelled = false;
+    const list = pairsRef.current ?? [];
+    const out = new Map<string, number>();
+    const unknown = list.filter((p) => {
+      const hit = pairScoreMemCache.get(p.key);
+      if (hit !== undefined) {
+        out.set(p.key, hit);
+        return false;
+      }
+      return true;
+    });
+    setState((s) => ({
+      pairScores: new Map([...s.pairScores, ...out]),
+      pending: unknown.length,
+    }));
+    if (!unknown.length) return;
+
+    (async () => {
+      // Cached verdicts from other users / sessions.
+      const { data } = await supabase
+        .from('card_pairs')
+        .select('left_id,right_id,score')
+        .in('left_id', unknown.map((p) => p.left.card_id));
+      const wanted = new Map(unknown.map((p) => [p.key, p]));
+      for (const row of (data ?? []) as { left_id: string; right_id: string; score: number }[]) {
+        const k = `${row.left_id}|${row.right_id}`;
+        if (wanted.has(k)) {
+          out.set(k, row.score);
+          pairScoreMemCache.set(k, row.score);
+          wanted.delete(k);
+        }
+      }
+      const toCompute = [...wanted.values()];
+      if (!cancelled) {
+        setState((s) => ({
+          pairScores: new Map([...s.pairScores, ...out]),
+          pending: toCompute.length,
+        }));
+      }
+
+      for (let i = 0; i < toCompute.length; i += PAIR_CHUNK) {
+        if (cancelled) return;
+        const chunk = toCompute.slice(i, i + PAIR_CHUNK);
+        try {
+          const { data: res, error } = await supabase.functions.invoke('card-panorama', {
+            body: { pairs: chunk.map(({ left, right }) => ({ left, right })) },
+          });
+          const scores = (!error && res?.scores) ? res.scores as Record<string, number> : {};
+          for (const p of chunk) {
+            const s = scores[p.key] ?? -1;
+            out.set(p.key, s);
+            pairScoreMemCache.set(p.key, s);
+          }
+        } catch {
+          for (const p of chunk) {
+            out.set(p.key, -1);
+            pairScoreMemCache.set(p.key, -1);
+          }
+        }
+        if (!cancelled) {
+          setState((s) => ({
+            pairScores: new Map([...s.pairScores, ...out]),
+            pending: Math.max(0, toCompute.length - (i + chunk.length)),
+          }));
+        }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [key]);
+
+  return state;
+}
+
+export interface AppliedIdea {
+  pageId: string;
+  pageIndex: number;
+  prev: { id: string; position: number }[];
+}
+
+/** Apply a Curator idea: append a titled page and move the idea's cards into
+ *  its slots. Returns everything undo needs. */
+export function useApplyIdea() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      binderId, title, moveRowIds, slotOffsets, slotsPerPage,
+    }: {
+      binderId: string;
+      title: string;
+      moveRowIds: string[];
+      slotOffsets: number[];
+      slotsPerPage: number;
+    }): Promise<AppliedIdea> => {
+      // Snapshot positions for undo, and as a staleness check: bail if a row
+      // moved or was removed since the ideas were generated.
+      const { data: prevRows, error: prevErr } = await supabase
+        .from('collections')
+        .select('id,position')
+        .in('id', moveRowIds)
+        .eq('binder_id', binderId);
+      if (prevErr) throw prevErr;
+      if ((prevRows?.length ?? 0) !== moveRowIds.length) {
+        throw new Error('Some of these cards changed since the ideas were made — pull to refresh.');
+      }
+
+      const [{ data: lastPage, error: pErr }, { data: lastCard, error: cErr }] = await Promise.all([
+        supabase.from('binder_pages').select('page_index').eq('binder_id', binderId)
+          .order('page_index', { ascending: false }).limit(1),
+        supabase.from('collections').select('position').eq('binder_id', binderId)
+          .order('position', { ascending: false }).limit(1).maybeSingle(),
+      ]);
+      if (pErr) throw pErr;
+      if (cErr) throw cErr;
+      // Land past both the last page row and the last occupied slot; the two
+      // can disagree when binder_pages lags behind sparse positions.
+      const pageIndex = Math.max(
+        (lastPage?.[0]?.page_index ?? -1) + 1,
+        Math.ceil(((lastCard?.position ?? -1) + 1) / slotsPerPage),
+      );
+
+      const { data: pageRow, error: insErr } = await supabase
+        .from('binder_pages')
+        .insert({ binder_id: binderId, page_index: pageIndex, title })
+        .select('id')
+        .single();
+      if (insErr) throw insErr;
+
+      const positions = slotOffsets.map((off) => pageIndex * slotsPerPage + off);
+      const { data: affected, error: rErr } = await supabase.rpc('reorder_cards_swap', {
+        binder: binderId,
+        ids: moveRowIds,
+        positions,
+      });
+      if (rErr || (typeof affected === 'number' && affected !== moveRowIds.length)) {
+        // Clean up the orphan page before surfacing the failure.
+        await supabase.from('binder_pages').delete().eq('id', pageRow.id);
+        throw rErr ?? new Error('Not every card could be moved — refresh and retry.');
+      }
+
+      return {
+        pageId: pageRow.id as string,
+        pageIndex,
+        prev: (prevRows ?? []) as { id: string; position: number }[],
+      };
+    },
+    onSuccess: (_r, vars) => {
+      qc.invalidateQueries({ queryKey: KEY.collectionByBinder(vars.binderId) });
+      qc.invalidateQueries({ queryKey: KEY.binderPages(vars.binderId) });
+      qc.invalidateQueries({ queryKey: KEY.collection });
+    },
+  });
+}
+
+/** Reverse a just-applied idea: cards back to their old slots, page deleted.
+ *  The applied page is always the last one and ends up empty. */
+export function useUndoApplyIdea() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      binderId, applied,
+    }: { binderId: string; applied: AppliedIdea }) => {
+      const { error: rErr } = await supabase.rpc('reorder_cards_swap', {
+        binder: binderId,
+        ids: applied.prev.map((p) => p.id),
+        positions: applied.prev.map((p) => p.position),
+      });
+      if (rErr) throw rErr;
+      const { error: dErr } = await supabase
+        .from('binder_pages')
+        .delete()
+        .eq('id', applied.pageId);
+      if (dErr) throw dErr;
+    },
+    onSuccess: (_r, vars) => {
+      qc.invalidateQueries({ queryKey: KEY.collectionByBinder(vars.binderId) });
+      qc.invalidateQueries({ queryKey: KEY.binderPages(vars.binderId) });
+      qc.invalidateQueries({ queryKey: KEY.collection });
     },
   });
 }

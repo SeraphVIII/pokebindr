@@ -1,11 +1,8 @@
-// "My Collection" — a flat, scrollable list of every card the user owns
-// (across all binders), with toggleable sort.
-//
-// Pinned at the top of the Binder tab.
+// My Collection — a flat list of every owned card across all binders.
 
 import { useMemo, useState } from 'react';
 import {
-  ScrollView, View, Text, Pressable, Image, RefreshControl, TextInput,
+  FlatList, View, Text, Pressable, Image, RefreshControl, TextInput,
 } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
@@ -13,11 +10,12 @@ import { useQueryClient } from '@tanstack/react-query';
 import { Screen } from '@/components/Screen';
 import { Eyebrow } from '@/components/Eyebrow';
 import { Chip } from '@/components/Chip';
-import { useCollection, useBinders, useRemoveCards } from '@/lib/queries';
+import { IconDisc } from '@/components/ui';
+import { useCollection, useBinders, useRemoveCards, usePrefetchCard } from '@/lib/queries';
 import { useConfirm } from '@/components/ConfirmDialog';
 import { theme } from '@/lib/theme';
 
-type Sort = 'recent' | 'name' | 'set' | 'price';
+type Sort = 'recent' | 'name' | 'price';
 type StatusFilter = 'all' | 'have' | 'want' | 'really';
 
 // One "group" = one unique card_id. Aggregates qty across all instances.
@@ -37,8 +35,14 @@ type CardGroup = {
 const SORT_LABELS: Record<Sort, string> = {
   recent: 'Recent',
   name:   'Name',
-  set:    'Set',
   price:  'Price',
+};
+// Each sort's "natural" first-tap direction. A second tap on the same chip
+// flips it; tapping a different chip resets to that sort's default.
+const DEFAULT_REVERSE: Record<Sort, boolean> = {
+  recent: false, // newest-first
+  name:   false, // A→Z
+  price:  false, // high→low
 };
 
 export default function MyCollection() {
@@ -48,8 +52,14 @@ export default function MyCollection() {
   const { data: rows = [] } = useCollection();
   const { data: binders = [] } = useBinders();
   const removeCards = useRemoveCards();
+  const prefetchCard = usePrefetchCard();
   const confirm = useConfirm();
   const [sort, setSort] = useState<Sort>('recent');
+  const [reverse, setReverse] = useState(DEFAULT_REVERSE.recent);
+  const onTapSort = (s: Sort) => {
+    if (s === sort) setReverse((r) => !r);
+    else { setSort(s); setReverse(DEFAULT_REVERSE[s]); }
+  };
   const [statusFilter, setStatusFilter] = useState<StatusFilter>(() => {
     if (statusParam === 'have' || statusParam === 'want' || statusParam === 'really') {
       return statusParam;
@@ -116,23 +126,20 @@ export default function MyCollection() {
     const arr = [...grouped];
     switch (sort) {
       case 'recent':
-        return arr.sort((a, b) => b.maxAddedAt.localeCompare(a.maxAddedAt));
+        arr.sort((a, b) => b.maxAddedAt.localeCompare(a.maxAddedAt));
+        break;
       case 'name':
-        return arr.sort((a, b) => a.card_name.localeCompare(b.card_name));
-      case 'set':
-        return arr.sort((a, b) => {
-          const s = a.set_name.localeCompare(b.set_name);
-          return s !== 0
-            ? s
-            : a.card_number.localeCompare(b.card_number, undefined, { numeric: true });
-        });
+        arr.sort((a, b) => a.card_name.localeCompare(b.card_name));
+        break;
       case 'price':
-        return arr.sort((a, b) => (b.price ?? -Infinity) - (a.price ?? -Infinity));
+        arr.sort((a, b) => (b.price ?? -Infinity) - (a.price ?? -Infinity));
+        break;
     }
-  }, [grouped, sort]);
+    if (reverse) arr.reverse();
+    return arr;
+  }, [grouped, sort, reverse]);
 
-  // Status filter + search applied AFTER sort so chips don't disturb existing
-  // order. Search matches on name + set name + card number (case-insensitive).
+  // Filter and search apply after sort so toggling chips keeps the order.
   const visible = useMemo(() => {
     let out = sorted;
     if (statusFilter !== 'all') {
@@ -205,32 +212,29 @@ export default function MyCollection() {
           flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
           paddingHorizontal: 14, paddingTop: 6,
         }}>
-          <Pressable onPress={() => router.back()} hitSlop={12}>
-            <Feather name="arrow-left" size={22} color={theme.textDim} />
-          </Pressable>
-          <Pressable onPress={() => setSelecting(true)} hitSlop={12}>
-            <Feather name="check-square" size={18} color={theme.textDim} />
-          </Pressable>
+          <IconDisc name="chevron-left" onPress={() => router.back()} />
+          <IconDisc name="check-square" iconSize={15} onPress={() => setSelecting(true)} />
         </View>
       )}
 
-      <View style={{ paddingHorizontal: 24, paddingTop: 4 }}>
+      <View style={{ paddingHorizontal: 24, paddingTop: 10 }}>
         <Eyebrow>
           {grouped.length} unique · {rows.length} {rows.length === 1 ? 'card' : 'cards'} · €{totalValue.toFixed(0)} · {binders.length} {binders.length === 1 ? 'binder' : 'binders'}
         </Eyebrow>
         <Text style={{
-          fontFamily: theme.fontDisplay,
-          fontSize: 30, color: theme.text, marginTop: 4, lineHeight: 40,
+          fontFamily: theme.fontDisplaySemi,
+          fontSize: 30, color: theme.text, marginTop: 4, lineHeight: 38,
         }}>My Collection</Text>
       </View>
 
       <View style={{ paddingHorizontal: 24, paddingTop: 14 }}>
         <View style={{
           flexDirection: 'row', alignItems: 'center', gap: 10,
-          backgroundColor: theme.surface,
-          borderWidth: 1, borderColor: theme.border,
-          borderRadius: theme.radius,
-          paddingHorizontal: 14, paddingVertical: 8,
+          backgroundColor: theme.glass,
+          borderWidth: 1, borderColor: theme.hairline,
+          borderRadius: theme.pill,
+          paddingHorizontal: 16, paddingVertical: 9,
+          boxShadow: theme.shadowInner,
         }}>
           <Feather name="search" size={16} color={theme.textDim} />
           <TextInput
@@ -241,12 +245,19 @@ export default function MyCollection() {
             autoCapitalize="none"
             style={{
               flex: 1, color: theme.text, fontSize: 14,
+              fontFamily: theme.fontUI,
               paddingVertical: 4,
             }}
           />
           {search.length > 0 && (
             <Pressable onPress={() => setSearch('')} hitSlop={6}>
-              <Feather name="x" size={16} color={theme.textDim} />
+              <View style={{
+                width: 20, height: 20, borderRadius: theme.pill,
+                backgroundColor: theme.glassStrong,
+                alignItems: 'center', justifyContent: 'center',
+              }}>
+                <Feather name="x" size={12} color={theme.textDim} />
+              </View>
             </Pressable>
           )}
         </View>
@@ -272,27 +283,46 @@ export default function MyCollection() {
           return (
             <Pressable
               key={s}
-              onPress={() => setSort(s)}
-              style={{
+              onPress={() => onTapSort(s)}
+              style={({ pressed }) => ({
                 alignSelf: 'flex-start',
-                paddingHorizontal: 10, paddingVertical: 5,
-                borderRadius: 999,
+                flexDirection: 'row', alignItems: 'center', gap: 4,
+                paddingHorizontal: 12, paddingVertical: 7,
+                borderRadius: theme.pill,
                 borderWidth: 1,
-                borderColor: active ? theme.accent : theme.border,
-                backgroundColor: active ? theme.accent : 'transparent',
-              }}>
+                borderColor: active ? theme.accent : theme.hairline,
+                backgroundColor: active ? theme.accentSoft : theme.glass,
+                transform: [{ scale: pressed ? 0.95 : 1 }],
+              })}>
               <Text style={{
                 fontFamily: theme.fontUIBold, fontSize: 11,
                 letterSpacing: 0.5, textTransform: 'uppercase',
-                color: active ? theme.accentText : theme.textDim,
+                color: active ? theme.accent : theme.textDim,
               }}>{SORT_LABELS[s]}</Text>
+              {active && (
+                <Feather
+                  name={reverse ? 'arrow-up' : 'arrow-down'}
+                  size={10}
+                  color={theme.accent}
+                />
+              )}
             </Pressable>
           );
         })}
       </View>
 
-      <ScrollView
-        contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 32 }}
+      {/* Keep this virtualized: mounting hundreds of groups at once stalls
+          the screen and starves the image pipeline. */}
+      <FlatList
+        data={visible}
+        keyExtractor={(g) => g.card_id}
+        style={{ flex: 1 }}
+        contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 32, flexGrow: 1 }}
+        initialNumToRender={12}
+        maxToRenderPerBatch={12}
+        windowSize={7}
+        removeClippedSubviews
+        keyboardShouldPersistTaps="handled"
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
@@ -301,14 +331,27 @@ export default function MyCollection() {
             colors={[theme.accent]}
           />
         }
-      >
-        {visible.length === 0 ? (
-          <Text style={{
-            color: theme.textDim, textAlign: 'center',
-            padding: 40, fontSize: 13,
-          }}>No cards yet.</Text>
-        ) : (
-          visible.map((g) => {
+        ListEmptyComponent={
+          <View style={{ padding: 40, alignItems: 'center', gap: 12 }}>
+            <View style={{
+              width: 52, height: 52, borderRadius: theme.pill,
+              backgroundColor: theme.glass,
+              borderWidth: 1, borderColor: theme.hairline,
+              alignItems: 'center', justifyContent: 'center',
+            }}>
+              <Feather name="layers" size={20} color={theme.textDim} />
+            </View>
+            <Text style={{
+              color: theme.textDim, textAlign: 'center',
+              fontSize: 13, fontFamily: theme.fontUI, lineHeight: 19,
+            }}>
+              {search.trim() || statusFilter !== 'all'
+                ? 'Nothing matches the current filters.'
+                : 'No cards yet. Add your first from Search.'}
+            </Text>
+          </View>
+        }
+        renderItem={({ item: g }) => {
             const dots: { color: string }[] = [];
             if (g.statuses.has('have'))   dots.push({ color: theme.statusHave });
             if (g.statuses.has('want'))   dots.push({ color: theme.statusWant });
@@ -316,7 +359,6 @@ export default function MyCollection() {
             const isSelected = selected.has(g.card_id);
             return (
               <Pressable
-                key={g.card_id}
                 onPress={() => {
                   if (selecting) {
                     setSelected((prev) => {
@@ -326,29 +368,31 @@ export default function MyCollection() {
                       return next;
                     });
                   } else {
+                    prefetchCard(g.card_id);
                     router.push(`/card/${g.card_id}`);
                   }
                 }}
                 onLongPress={() => {
-                  // Long-press anywhere enters selection mode and picks the
-                  // pressed card. Skipped when we're already selecting (the
-                  // regular onPress handles toggling).
+                  // While selecting, toggling is handled by onPress.
                   if (selecting) return;
                   setSelecting(true);
                   setSelected(new Set([g.card_id]));
                 }}
                 delayLongPress={300}
-                style={{
+                style={({ pressed }) => ({
                   flexDirection: 'row', alignItems: 'center', gap: 14,
-                  paddingVertical: 10, paddingHorizontal: 6,
-                  borderBottomWidth: 1, borderBottomColor: theme.border,
-                  backgroundColor: isSelected ? 'rgba(212,175,55,0.12)' : 'transparent',
-                }}>
+                  paddingVertical: 11, paddingHorizontal: 8,
+                  borderRadius: theme.radiusSm,
+                  borderBottomWidth: 1, borderBottomColor: theme.hairline,
+                  backgroundColor: isSelected
+                    ? theme.accentSoft
+                    : pressed ? theme.accentFaint : 'transparent',
+                })}>
                 {selecting && (
                   <View style={{
                     width: 22, height: 22, borderRadius: 11,
                     borderWidth: 1.5,
-                    borderColor: isSelected ? theme.accent : theme.border,
+                    borderColor: isSelected ? theme.accent : theme.hairline,
                     backgroundColor: isSelected ? theme.accent : 'transparent',
                     alignItems: 'center', justifyContent: 'center',
                   }}>
@@ -358,22 +402,22 @@ export default function MyCollection() {
                 {g.image_small ? (
                   <Image
                     source={{ uri: g.image_small }}
-                    style={{ width: 44, height: 62, borderRadius: 4, backgroundColor: theme.surface2 }}
+                    style={{ width: 44, height: 62, borderRadius: 6, backgroundColor: theme.surface2 }}
                   />
                 ) : (
-                  <View style={{ width: 44, height: 62, borderRadius: 4, backgroundColor: theme.surface2 }} />
+                  <View style={{ width: 44, height: 62, borderRadius: 6, backgroundColor: theme.surface2 }} />
                 )}
                 <View style={{ flex: 1, minWidth: 0 }}>
-                  <Text style={{ color: theme.text, fontSize: 15 }} numberOfLines={1}>
+                  <Text style={{ color: theme.text, fontSize: 15, fontFamily: theme.fontUIBold }} numberOfLines={1}>
                     {g.card_name}
                   </Text>
                   <Text style={{
                     color: theme.textDim, fontSize: 11,
-                    fontFamily: theme.fontMono, marginTop: 2,
-                  }}>
+                    fontFamily: theme.fontMono, marginTop: 3,
+                  }} numberOfLines={1}>
                     {g.set_name} · {g.card_number}{g.rarity ? ` · ${g.rarity}` : ''}
                   </Text>
-                  <View style={{ flexDirection: 'row', gap: 3, marginTop: 4 }}>
+                  <View style={{ flexDirection: 'row', gap: 3, marginTop: 5 }}>
                     {dots.map((d, i) => (
                       <View key={i} style={{
                         width: 6, height: 6, borderRadius: 3,
@@ -382,24 +426,28 @@ export default function MyCollection() {
                     ))}
                   </View>
                 </View>
-                <View style={{ alignItems: 'flex-end', gap: 4 }}>
+                <View style={{ alignItems: 'flex-end', gap: 5 }}>
+                  <View style={{
+                    paddingHorizontal: 8, paddingVertical: 3,
+                    borderRadius: theme.pill,
+                    backgroundColor: theme.accentSoft,
+                  }}>
+                    <Text style={{
+                      color: theme.accent, fontSize: 10,
+                      fontFamily: theme.fontMono, letterSpacing: 0.5,
+                    }}>×{g.qty}</Text>
+                  </View>
                   <Text style={{
-                    color: theme.accent, fontSize: 12,
-                    fontFamily: theme.fontUIBold,
-                    letterSpacing: 0.5, textTransform: 'uppercase',
-                  }}>Qty × {g.qty}</Text>
-                  <Text style={{
-                    color: theme.text, fontSize: 13, fontWeight: '600',
+                    color: g.price != null ? theme.text : theme.textMute, fontSize: 13,
                     fontFamily: theme.fontMono,
                   }}>
-                    {g.price != null ? `€${g.price.toFixed(2)}` : '—'}
+                    {g.price != null ? `€${g.price.toFixed(2)}` : '·'}
                   </Text>
                 </View>
               </Pressable>
             );
-          })
-        )}
-      </ScrollView>
+        }}
+      />
     </Screen>
   );
 }
