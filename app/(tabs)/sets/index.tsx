@@ -1,12 +1,12 @@
-// Sets browser — every TCGdex set, newest first. Tap a set to drill into
-// its cards with a rarity filter.
+// Sets browser: every TCGdex set, newest first.
 
-import { View, Text, FlatList, Pressable, Image, ActivityIndicator, TextInput } from 'react-native';
+import { View, Text, FlatList, Pressable, Image, TextInput } from 'react-native';
 import { useMemo, useState } from 'react';
 import { useRouter } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
 import { Screen } from '@/components/Screen';
 import { Eyebrow } from '@/components/Eyebrow';
+import { Skeleton } from '@/components/ui';
 import { useSets } from '@/lib/queries';
 import { theme } from '@/lib/theme';
 import type { TcgdexSet } from '@/lib/tcgdex';
@@ -16,10 +16,8 @@ export default function SetsList() {
   const router = useRouter();
   const [q, setQ] = useState('');
 
-  // TCGdex returns sets in series order; reverse so newest is first. Apply
-  // a simple substring filter when the user searches. Drop sets whose
-  // shortcode starts with a capital letter — those are TCGdex's legacy /
-  // pre-modern entries the user has opted out of seeing.
+  // TCGdex returns sets in series order, so reverse for newest-first. Set ids
+  // starting with a capital letter are legacy/pre-modern entries; drop them.
   const visible = useMemo(() => {
     const filtered = sets.filter((s) => !/^[A-Z]/.test(s.id));
     const reversed = filtered.reverse();
@@ -37,8 +35,8 @@ export default function SetsList() {
       <View style={{ padding: 24, paddingBottom: 12 }}>
         <Eyebrow>TCGdex library</Eyebrow>
         <Text style={{
-          fontFamily: theme.fontDisplay,
-          fontSize: 30, color: theme.text, marginTop: 4, lineHeight: 40,
+          fontFamily: theme.fontDisplaySemi,
+          fontSize: 30, color: theme.text, marginTop: 4, lineHeight: 38,
         }}>Sets</Text>
         <Text style={{
           color: theme.textDim, fontSize: 12, fontFamily: theme.fontMono,
@@ -51,10 +49,11 @@ export default function SetsList() {
       <View style={{ paddingHorizontal: 24, paddingBottom: 12 }}>
         <View style={{
           flexDirection: 'row', alignItems: 'center', gap: 10,
-          backgroundColor: theme.surface,
-          borderWidth: 1, borderColor: theme.border,
-          borderRadius: theme.radius,
-          paddingHorizontal: 14, paddingVertical: 8,
+          backgroundColor: theme.glass,
+          borderWidth: 1, borderColor: theme.hairline,
+          borderRadius: theme.pill,
+          paddingHorizontal: 16, paddingVertical: 9,
+          boxShadow: theme.shadowInner,
         }}>
           <Feather name="search" size={16} color={theme.textDim} />
           <TextInput
@@ -66,27 +65,42 @@ export default function SetsList() {
             autoCorrect={false}
             style={{
               flex: 1, color: theme.text, fontSize: 14,
+              fontFamily: theme.fontUI,
               paddingVertical: 4,
             }}
           />
           {q.length > 0 && (
             <Pressable onPress={() => setQ('')} hitSlop={6}>
-              <Feather name="x" size={16} color={theme.textDim} />
+              <View style={{
+                width: 20, height: 20, borderRadius: theme.pill,
+                backgroundColor: theme.glassStrong,
+                alignItems: 'center', justifyContent: 'center',
+              }}>
+                <Feather name="x" size={12} color={theme.textDim} />
+              </View>
             </Pressable>
           )}
         </View>
       </View>
 
       {isLoading ? (
-        <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
-          <ActivityIndicator color={theme.accent} />
+        <View style={{ paddingHorizontal: 24, gap: 14, paddingTop: 8 }}>
+          {[0, 1, 2, 3, 4, 5].map((i) => (
+            <View key={i} style={{ flexDirection: 'row', alignItems: 'center', gap: 14 }}>
+              <Skeleton width={54} height={54} radius={10} />
+              <View style={{ flex: 1, gap: 8 }}>
+                <Skeleton width="60%" height={14} radius={6} />
+                <Skeleton width="35%" height={10} radius={5} />
+              </View>
+            </View>
+          ))}
         </View>
       ) : (
         <FlatList
           data={visible}
           keyExtractor={(s) => `${s.locale ?? 'en'}-${s.id}`}
           contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 32 }}
-          ItemSeparatorComponent={() => <View style={{ height: 1, backgroundColor: theme.border, marginLeft: 70 }} />}
+          ItemSeparatorComponent={() => <View style={{ height: 1, backgroundColor: theme.hairline, marginLeft: 70 }} />}
           renderItem={({ item }) => (
             <SetRow
               set={item}
@@ -95,6 +109,14 @@ export default function SetsList() {
               )}
             />
           )}
+          ListEmptyComponent={
+            <Text style={{
+              color: theme.textDim, textAlign: 'center', padding: 40,
+              fontFamily: theme.fontUI, fontSize: 13,
+            }}>
+              No sets match.
+            </Text>
+          }
         />
       )}
     </Screen>
@@ -106,10 +128,12 @@ function SetRow({ set, onPress }: { set: TcgdexSet; onPress: () => void }) {
   return (
     <Pressable
       onPress={onPress}
-      style={{
+      style={({ pressed }) => ({
         flexDirection: 'row', alignItems: 'center', gap: 14,
         paddingVertical: 14, paddingHorizontal: 8,
-      }}
+        borderRadius: theme.radiusSm,
+        backgroundColor: pressed ? theme.accentFaint : 'transparent',
+      })}
     >
       {set.logo ? (
         <Image
@@ -132,17 +156,15 @@ function SetRow({ set, onPress }: { set: TcgdexSet; onPress: () => void }) {
       <View style={{ flex: 1, minWidth: 0 }}>
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
           <Text style={{
-            color: theme.text, fontSize: 15, fontFamily: theme.fontUI,
+            color: theme.text, fontSize: 15, fontFamily: theme.fontUIBold,
             flexShrink: 1,
           }} numberOfLines={1}>
             {set.name}
           </Text>
           <View style={{
-            paddingHorizontal: 6, paddingVertical: 2,
-            borderRadius: 4,
-            backgroundColor: theme.accent2 + '22',
-            borderWidth: 1,
-            borderColor: theme.accent2 + '88',
+            paddingHorizontal: 7, paddingVertical: 2.5,
+            borderRadius: theme.pill,
+            backgroundColor: theme.accentSoft,
           }}>
             <Text style={{
               color: theme.accent,

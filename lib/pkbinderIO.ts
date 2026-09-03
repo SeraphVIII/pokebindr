@@ -1,16 +1,7 @@
 // Side-effecting helpers for .pkbinder export/import.
-//
-// Export (Android-only): writes straight into the public Downloads folder
-// via MediaStore — no SAF picker, no share sheet. Requires a development
-// build because react-native-blob-util is a native module that Expo Go
-// can't load.
-//
-// Import: opens the document picker, reads the chosen file, returns a
-// validated PkBinderFile.
 
 import { File, Paths } from 'expo-file-system';
 import * as DocumentPicker from 'expo-document-picker';
-import ReactNativeBlobUtil from 'react-native-blob-util';
 import {
   parsePkBinder,
   pkBinderFilename,
@@ -25,22 +16,30 @@ export async function exportBinderToFile(
   json: string,
   binderName: string,
 ): Promise<string | null> {
+  // Lazy require: react-native-blob-util is a native module Expo Go doesn't
+  // ship, and a top-level import would crash every route pulling in this file.
+  let RNBlobUtil: any;
+  try {
+    RNBlobUtil = require('react-native-blob-util').default;
+  } catch {}
+  if (!RNBlobUtil?.MediaCollection?.copyToMediaStore) {
+    throw new Error('Exporting needs the installed app build — it is not available in Expo Go.');
+  }
+
   const filename = pkBinderFilename(binderName);
 
-  // copyToMediaStore needs a source path — stage the JSON in the cache dir
-  // first, then hand its path to the native module which moves it into
-  // MediaStore.Downloads. The temp file gets cleaned up by the OS when
-  // the cache is pruned; we delete it eagerly anyway.
+  // copyToMediaStore needs a source path: stage the JSON in the cache dir,
+  // then let the native module move it into MediaStore.Downloads.
   const staging = new File(Paths.cache, filename);
   if (staging.exists) staging.delete();
   staging.create();
   staging.write(json);
 
-  // Strip the file:// prefix — the native module expects a bare path.
+  // The native module expects a bare path without the file:// prefix.
   const sourcePath = staging.uri.replace(/^file:\/\//, '');
 
   try {
-    await ReactNativeBlobUtil.MediaCollection.copyToMediaStore(
+    await RNBlobUtil.MediaCollection.copyToMediaStore(
       { name: filename, parentFolder: '', mimeType: PKBINDER_MIME } as any,
       'Download',
       sourcePath,
@@ -51,14 +50,13 @@ export async function exportBinderToFile(
   return filename;
 }
 
-/** Open the document picker, parse the chosen file, return a validated
- *  payload ready for useImportBinder. Resolves to `null` when the user
- *  cancels — the caller decides whether to toast or stay silent. */
+/** Open the document picker, parse the chosen file, and return a validated
+ *  payload. Resolves to `null` on cancel. */
 export async function pickAndImportBinder(): Promise<PkBinderFile | null> {
   const result = await DocumentPicker.getDocumentAsync({
-    // No reliable MIME for our custom .pkbinder extension; accept JSON +
-    // wildcard so the picker doesn't grey out our files on Android.
-    type: ['application/json', '*/*'],
+    // Android's picker filters by MIME, not extension; exports are tagged
+    // application/json in MediaStore so they show under this filter.
+    type: 'application/json',
     copyToCacheDirectory: true,
     multiple: false,
   });

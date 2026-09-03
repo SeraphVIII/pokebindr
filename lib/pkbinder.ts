@@ -1,24 +1,15 @@
-// .pkbinder file format — a portable JSON snapshot of one binder.
-//
-// What we keep:
-//   - Binder shape (name, grid).
-//   - Per-page metadata (title).
-//   - Each card's TCGdex id, denormalized display fields (so the file
-//     restores fully offline), status/condition/quantity/notes, and its
-//     binder-global position.
-//
-// What we drop:
-//   - user_id, binder_id, row ids, timestamps — those are reassigned on import.
-//   - last_price_eur / price_checked_at — prices refresh on view.
-//   - share_token, visibility, likes_count — never travel with the file.
-//   - is_bulk — the bulk binder is a per-user singleton, not exportable.
+// .pkbinder file format: a portable JSON snapshot of one binder.
+// Server-assigned fields (ids, timestamps, prices, share state) are not
+// serialized; they are reassigned or refreshed on import.
 
 import type { Binder, BinderPage, CollectionRow, Status } from './types';
 
 export const PKBINDER_FORMAT = 'pkbinder';
 export const PKBINDER_VERSION = 1;
 export const PKBINDER_MIME = 'application/json';
-export const PKBINDER_EXT = 'pkbinder';
+// Double extension on purpose: the trailing `.json` makes Android infer MIME
+// `application/json` so the document picker's JSON filter shows these files.
+export const PKBINDER_EXT = 'pkbinder.json';
 
 export interface PkBinderCard {
   card_id: string;
@@ -33,6 +24,8 @@ export interface PkBinderCard {
   status: Status;
   condition: string;
   quantity: number;
+  /** Printing key ('normal', 'reverse', …). Absent in v1 files. */
+  variant?: string | null;
   notes: string | null;
   position: number;
 }
@@ -82,6 +75,7 @@ export function serializeBinder(
         status: c.status,
         condition: c.condition,
         quantity: c.quantity,
+        variant: c.variant ?? null,
         notes: c.notes,
         position: c.position,
       })),
@@ -168,6 +162,7 @@ export function parsePkBinder(text: string): PkBinderFile {
       status,
       condition: String(c.condition ?? 'NM'),
       quantity,
+      variant: c.variant == null ? null : String(c.variant),
       notes: c.notes == null ? null : String(c.notes),
       position,
     };
@@ -183,8 +178,8 @@ export function parsePkBinder(text: string): PkBinderFile {
   };
 }
 
-/** Slugify a binder name for a filename — strict ASCII so share targets
- *  on any platform won't choke on the resulting file. */
+/** Slugify a binder name for a filename; strict ASCII for cross-platform
+ *  share targets. */
 export function pkBinderFilename(name: string): string {
   const slug = name
     .normalize('NFKD')
