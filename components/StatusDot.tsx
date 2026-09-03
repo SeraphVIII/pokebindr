@@ -1,4 +1,4 @@
-// StatusDot — coloured dot indicating Have / Want / Need.
+// Coloured dot indicating collection status.
 
 import { View } from 'react-native';
 import { statusColor } from './CardSlot';

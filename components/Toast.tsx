@@ -1,6 +1,5 @@
-// App-wide toast/snackbar. Replaces native Alert.alert for non-blocking
-// feedback (success, info, error). Mount once via <ToastProvider> at the
-// root; call useToast() from any screen to show().
+// App-wide toast/snackbar for non-blocking feedback. Mount <ToastProvider>
+// once at the root; call useToast() from any screen.
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { Animated, Pressable, Text, View } from 'react-native';
@@ -68,8 +67,9 @@ function ToastStack({
     <View
       pointerEvents="box-none"
       style={{
+        // Offset clears the floating tab dock.
         position: 'absolute', left: 0, right: 0,
-        bottom: insets.bottom + 12,
+        bottom: insets.bottom + 84,
         alignItems: 'center',
       }}
     >
@@ -95,7 +95,6 @@ const KIND_ICON: Record<ToastKind, 'info' | 'check-circle' | 'alert-triangle'> =
 function ToastBubble({
   toast, onDismiss,
 }: { toast: ToastItem; onDismiss: () => void }) {
-  // Slide up + fade in, hold 2.4s, slide out + fade out.
   const opacity = useRef(new Animated.Value(0)).current;
   const translateY = useRef(new Animated.Value(20)).current;
 
@@ -125,15 +124,21 @@ function ToastBubble({
       <Pressable
         onPress={onDismiss}
         style={{
-          flexDirection: 'row', alignItems: 'center', gap: 10,
-          paddingVertical: 12, paddingHorizontal: 14,
-          backgroundColor: theme.surface,
-          borderWidth: 1, borderColor: KIND_COLOR[toast.kind] + 'AA',
-          borderLeftWidth: 3, borderLeftColor: KIND_COLOR[toast.kind],
-          borderRadius: theme.radius,
+          flexDirection: 'row', alignItems: 'center', gap: 12,
+          paddingVertical: 10, paddingHorizontal: 12, paddingRight: 18,
+          backgroundColor: 'rgba(26,21,17,0.98)',
+          borderWidth: 1, borderColor: theme.hairline,
+          borderRadius: theme.pill,
+          boxShadow: `${theme.shadowAmbient}, ${theme.shadowInner}`,
         }}
       >
-        <Feather name={KIND_ICON[toast.kind]} size={16} color={KIND_COLOR[toast.kind]} />
+        <View style={{
+          width: 30, height: 30, borderRadius: theme.pill,
+          alignItems: 'center', justifyContent: 'center',
+          backgroundColor: KIND_COLOR[toast.kind] + '22',
+        }}>
+          <Feather name={KIND_ICON[toast.kind]} size={15} color={KIND_COLOR[toast.kind]} />
+        </View>
         <Text
           numberOfLines={3}
           style={{

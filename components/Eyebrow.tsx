@@ -1,4 +1,4 @@
-// Eyebrow — small monospace label, used everywhere as a section caption.
+// Small monospace label used as a section caption.
 
 import { Text, TextProps } from 'react-native';
 import { theme } from '@/lib/theme';

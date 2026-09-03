@@ -1,21 +1,22 @@
-// Read-only binder view used by public routes (/u/[username]/binder/[id]
-// and /share/[token]). Renders the page grid + simple paging arrows.
-// Supports fling-left / fling-right to flip pages (no animation, just
-// gesture-driven navigation).
+// Read-only binder view for the public routes (/u/[username]/binder/[id]
+// and /share/[token]). Page grid with arrows and fling-to-flip paging.
 
-import { useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { View, Text, Pressable, ActivityIndicator, Modal, ScrollView } from 'react-native';
 import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Gesture, GestureDetector, Directions } from 'react-native-gesture-handler';
-import { runOnJS } from 'react-native-reanimated';
+import Animated, {
+  runOnJS, useSharedValue, useAnimatedStyle, withTiming,
+} from 'react-native-reanimated';
 import { Feather } from '@expo/vector-icons';
 import { Screen } from '@/components/Screen';
 import { Eyebrow } from '@/components/Eyebrow';
+import { IconDisc, Skeleton } from '@/components/ui';
 import { CardSlot, EmptySlot } from '@/components/CardSlot';
 import { clampToContent } from '@/lib/layout';
 import { Dimensions } from 'react-native';
-import { useDidILikeBinder, useToggleLike, useBinders, useCopyPageToMyBinder } from '@/lib/queries';
+import { useDidILikeBinder, useToggleLike, useBinders, useCopyPageToMyBinder, usePrefetchCard } from '@/lib/queries';
 import { useSession } from '@/lib/auth';
 import { useToast } from '@/components/Toast';
 import { theme } from '@/lib/theme';
@@ -31,6 +32,14 @@ interface Props {
 
 export function PublicBinderView({ binder, pages, cards, loading, ownerLabel }: Props) {
   const router = useRouter();
+
+  // Prefetch on tap so /card/[id] mounts cache-hit instead of blocking on a
+  // cold TCGdex fetch during the navigation animation.
+  const prefetchCard = usePrefetchCard();
+  const openCard = (cardId: string) => {
+    prefetchCard(cardId);
+    router.push(`/card/${cardId}`);
+  };
   const { session } = useSession();
   const toast = useToast();
   const { data: liked = false } = useDidILikeBinder(binder.id);
@@ -57,7 +66,7 @@ export function PublicBinderView({ binder, pages, cards, loading, ownerLabel }: 
   const current = Math.min(pageIdx, pageCount - 1);
   const currentPage = pages[current];
 
-  // Layout — same maths as the authed binder view.
+  // Same layout maths as the authed binder view.
   const winW = clampToContent(Dimensions.get('window').width);
   const railPad = 20;
   const gap = 8;
@@ -65,7 +74,6 @@ export function PublicBinderView({ binder, pages, cards, loading, ownerLabel }: 
   const cardW = (innerW - gap * (cols - 1)) / cols;
   const cardH = cardW * 1.4;
 
-  // Build a position → card lookup for the current page.
   const start = current * slotsPerPage;
   const cardByPos = new Map<number, CollectionRow>();
   for (const c of cards) cardByPos.set(c.position, c);
@@ -107,12 +115,37 @@ export function PublicBinderView({ binder, pages, cards, loading, ownerLabel }: 
     setCopyPickerOpen(true);
   };
 
-  // Fling-left → next page, fling-right → previous page. Re-created per
-  // render because the closure captures `current` and `pageCount`.
+  // Pager: all pages mounted in one horizontal track. Flipping translates the
+  // track, so grids never remount.
+  const gridW = cols * cardW + (cols - 1) * gap;
+  const gridH = rowsN * cardH + (rowsN - 1) * gap;
+  const trackOffset = useSharedValue(-current * gridW);
+  const isFlippingRef = useRef(false);
+  const clearFlipping = () => { isFlippingRef.current = false; };
   const flipBy = (delta: number) => {
-    setPageIdx((p) => Math.max(0, Math.min(pageCount - 1, p + delta)));
+    const next = Math.max(0, Math.min(pageCount - 1, current + delta));
+    if (next === current) return;
+    isFlippingRef.current = true;
+    trackOffset.value = withTiming(-next * gridW, { duration: 260 }, (done) => {
+      if (done) runOnJS(clearFlipping)();
+    });
+    setPageIdx(next);
   };
-  const flingGesture = Gesture.Race(
+
+  // Re-snap on dimension changes (rotation) unless mid-animation.
+  useEffect(() => {
+    if (!isFlippingRef.current) {
+      trackOffset.value = -current * gridW;
+    }
+    // `current` intentionally excluded; flipBy handles page-change snapping.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gridW]);
+
+  const trackStyle = useAnimatedStyle(() => ({
+    transform: [{ translateX: trackOffset.value }],
+  }));
+
+  const flingGesture = useMemo(() => Gesture.Race(
     Gesture.Fling().direction(Directions.LEFT).onEnd(() => {
       'worklet';
       runOnJS(flipBy)(1);
@@ -121,7 +154,9 @@ export function PublicBinderView({ binder, pages, cards, loading, ownerLabel }: 
       'worklet';
       runOnJS(flipBy)(-1);
     }),
-  );
+    // flipBy captures `current` and `pageCount`; re-create on change so the
+    // gesture does not clamp against stale bounds.
+  ), [current, pageCount, gridW]);
 
   return (
     <Screen>
@@ -129,9 +164,7 @@ export function PublicBinderView({ binder, pages, cards, loading, ownerLabel }: 
         flexDirection: 'row', alignItems: 'center', gap: 10,
         paddingHorizontal: 14, paddingTop: 6, paddingBottom: 2,
       }}>
-        <Pressable onPress={() => router.back()} hitSlop={12}>
-          <Feather name="arrow-left" size={22} color={theme.textDim} />
-        </Pressable>
+        <IconDisc name="chevron-left" onPress={() => router.back()} />
         <View style={{ flex: 1, minWidth: 0 }}>
           {ownerLabel && (
             <Text style={{ color: theme.textDim, fontSize: 11, fontFamily: theme.fontMono }}>
@@ -140,7 +173,7 @@ export function PublicBinderView({ binder, pages, cards, loading, ownerLabel }: 
           )}
           <Text
             numberOfLines={1}
-            style={{ fontFamily: theme.fontDisplay, fontSize: 22, color: theme.text }}
+            style={{ fontFamily: theme.fontDisplaySemi, fontSize: 22, color: theme.text }}
           >
             {binder.name}
           </Text>
@@ -148,17 +181,25 @@ export function PublicBinderView({ binder, pages, cards, loading, ownerLabel }: 
         <Pressable
           onPress={onToggleLike}
           hitSlop={8}
-          style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}
+          style={({ pressed }) => ({
+            flexDirection: 'row', alignItems: 'center', gap: 6,
+            paddingHorizontal: 11, paddingVertical: 7,
+            borderRadius: theme.pill,
+            backgroundColor: liked ? theme.statusReallySoft : theme.glass,
+            borderWidth: 1,
+            borderColor: liked ? 'rgba(205,99,99,0.4)' : theme.hairline,
+            transform: [{ scale: pressed ? 0.92 : 1 }],
+          })}
         >
           <Feather
             name="heart"
-            size={18}
+            size={15}
             color={liked ? theme.statusReally : theme.textDim}
           />
           <Text style={{
             color: liked ? theme.statusReally : theme.textDim,
-            fontFamily: theme.fontMono, fontSize: 13,
-            minWidth: 14, textAlign: 'right',
+            fontFamily: theme.fontMono, fontSize: 12,
+            minWidth: 12, textAlign: 'right',
           }}>
             {binder.likes_count}
           </Text>
@@ -196,13 +237,15 @@ export function PublicBinderView({ binder, pages, cards, loading, ownerLabel }: 
             onPress={onTapCopy}
             disabled={copyPage.isPending}
             hitSlop={6}
-            style={{
-              flexDirection: 'row', alignItems: 'center', gap: 4,
-              paddingHorizontal: 8, paddingVertical: 4,
-              borderRadius: 999,
+            style={({ pressed }) => ({
+              flexDirection: 'row', alignItems: 'center', gap: 5,
+              paddingHorizontal: 11, paddingVertical: 7,
+              borderRadius: theme.pill,
               borderWidth: 1, borderColor: theme.borderStrong,
+              backgroundColor: pressed ? theme.accentSoft : theme.glass,
               opacity: copyPage.isPending ? 0.5 : 1,
-            }}
+              transform: [{ scale: pressed ? 0.92 : 1 }],
+            })}
           >
             <Feather name="copy" size={12} color={theme.accent} />
             <Text style={{
@@ -216,78 +259,91 @@ export function PublicBinderView({ binder, pages, cards, loading, ownerLabel }: 
 
       {loading ? (
         <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
-          <ActivityIndicator color={theme.accent} />
+          <View style={{
+            width: gridW, height: gridH,
+            flexDirection: 'row', flexWrap: 'wrap', gap,
+            alignContent: 'flex-start',
+          }}>
+            {Array.from({ length: slotsPerPage }).map((_, i) => (
+              <Skeleton key={i} width={cardW} height={cardH} radius={Math.max(6, cardW * 0.08)} />
+            ))}
+          </View>
         </View>
       ) : (
-        <GestureDetector gesture={flingGesture}>
         <View style={{
           flex: 1,
           paddingHorizontal: railPad,
           alignItems: 'center',
           justifyContent: 'center',
         }}>
-          <View style={{
-            width: cols * cardW + (cols - 1) * gap,
-            height: rowsN * cardH + (rowsN - 1) * gap,
-          }}>
-            {Array.from({ length: slotsPerPage }).map((_, i) => {
-              const col = i % cols;
-              const row = Math.floor(i / cols);
-              const r = cardByPos.get(start + i);
-              return (
-                <View
-                  key={i}
-                  style={{
-                    position: 'absolute',
-                    left: col * (cardW + gap),
-                    top: row * (cardH + gap),
-                    width: cardW,
-                    height: cardH,
-                  }}
-                >
-                  {r ? (
-                    <CardSlot
-                      row={r}
-                      width={cardW}
-                      onPress={() => router.push(`/card/${r.card_id}`)}
-                    />
-                  ) : <EmptySlot width={cardW} />}
-                </View>
-              );
-            })}
-          </View>
+          <GestureDetector gesture={flingGesture}>
+            <View style={{ width: gridW, height: gridH, overflow: 'hidden' }}>
+              <Animated.View style={[
+                { flexDirection: 'row', width: gridW * pageCount, height: gridH },
+                trackStyle,
+              ]}>
+                {Array.from({ length: pageCount }).map((_, pageI) => {
+                  const pStart = pageI * slotsPerPage;
+                  return (
+                    <View key={pageI} style={{ width: gridW, height: gridH }}>
+                      {Array.from({ length: slotsPerPage }).map((_, i) => {
+                        const col = i % cols;
+                        const rowI = Math.floor(i / cols);
+                        const r = cardByPos.get(pStart + i);
+                        return (
+                          <View
+                            key={i}
+                            style={{
+                              position: 'absolute',
+                              left: col * (cardW + gap),
+                              top: rowI * (cardH + gap),
+                              width: cardW,
+                              height: cardH,
+                            }}
+                          >
+                            {r ? (
+                              <CardSlot
+                                row={r}
+                                width={cardW}
+                                onPress={() => openCard(r.card_id)}
+                              />
+                            ) : <EmptySlot width={cardW} />}
+                          </View>
+                        );
+                      })}
+                    </View>
+                  );
+                })}
+              </Animated.View>
+            </View>
+          </GestureDetector>
 
           {pageCount > 1 && (
             <View style={{
               flexDirection: 'row', alignItems: 'center', gap: 20,
               marginTop: 18,
             }}>
-              <Pressable
-                onPress={() => setPageIdx(Math.max(0, current - 1))}
-                disabled={current === 0}
-                hitSlop={10}
-                style={{ opacity: current === 0 ? 0.3 : 1 }}
-              >
-                <Feather name="chevron-left" size={24} color={theme.textDim} />
-              </Pressable>
+              <IconDisc
+                name="chevron-left"
+                size={34}
+                onPress={current === 0 ? undefined : () => flipBy(-1)}
+                style={{ opacity: current === 0 ? 0.35 : 1 }}
+              />
               <Text style={{
                 color: theme.text, fontFamily: theme.fontMono, fontSize: 14,
                 letterSpacing: 1, minWidth: 60, textAlign: 'center',
               }}>
                 {String(current + 1).padStart(2, '0')} / {String(pageCount).padStart(2, '0')}
               </Text>
-              <Pressable
-                onPress={() => setPageIdx(Math.min(pageCount - 1, current + 1))}
-                disabled={current === pageCount - 1}
-                hitSlop={10}
-                style={{ opacity: current === pageCount - 1 ? 0.3 : 1 }}
-              >
-                <Feather name="chevron-right" size={24} color={theme.textDim} />
-              </Pressable>
+              <IconDisc
+                name="chevron-right"
+                size={34}
+                onPress={current === pageCount - 1 ? undefined : () => flipBy(1)}
+                style={{ opacity: current === pageCount - 1 ? 0.35 : 1 }}
+              />
             </View>
           )}
         </View>
-        </GestureDetector>
       )}
 
       <CopyTargetSheet
@@ -321,26 +377,31 @@ function CopyTargetSheet({
       <View style={{ flex: 1, justifyContent: 'flex-end', alignItems: 'center' }}>
         <Pressable
           onPress={onClose}
-          style={{ flex: 1, alignSelf: 'stretch', backgroundColor: 'rgba(0,0,0,0.6)' }}
+          style={{ flex: 1, alignSelf: 'stretch', backgroundColor: theme.scrim }}
         />
         <View style={{
           width: '100%', maxWidth: theme.maxContentW,
           maxHeight: '60%',
           backgroundColor: theme.surface,
-          borderTopLeftRadius: theme.radius * 2,
-          borderTopRightRadius: theme.radius * 2,
+          borderTopLeftRadius: theme.radiusXl,
+          borderTopRightRadius: theme.radiusXl,
           borderTopWidth: 1, borderLeftWidth: 1, borderRightWidth: 1,
-          borderColor: theme.borderStrong,
-          paddingHorizontal: 20, paddingTop: 18,
+          borderColor: theme.hairline,
+          paddingHorizontal: 20, paddingTop: 12,
           paddingBottom: 24 + insets.bottom,
+          boxShadow: theme.shadowInner,
         }}>
+          <View style={{
+            alignSelf: 'center', width: 36, height: 4, borderRadius: 2,
+            backgroundColor: theme.glassStrong, marginBottom: 12,
+          }} />
           <Eyebrow>Copy page to</Eyebrow>
           <Text style={{
-            fontFamily: theme.fontDisplay,
-            fontSize: 20, color: theme.text, marginTop: 4, marginBottom: 4,
+            fontFamily: theme.fontDisplaySemi,
+            fontSize: 21, color: theme.text, marginTop: 4, marginBottom: 4,
           }}>Choose a binder</Text>
           <Text style={{
-            color: theme.textDim, fontSize: 11, marginBottom: 12,
+            color: theme.textDim, fontSize: 11, fontFamily: theme.fontUI, marginBottom: 12,
           }}>
             Cards land on a new page at the end, marked as &quot;want&quot;.
           </Text>
@@ -349,11 +410,13 @@ function CopyTargetSheet({
               <Pressable
                 key={b.id}
                 onPress={() => onPick(b.id)}
-                style={{
+                style={({ pressed }) => ({
                   flexDirection: 'row', alignItems: 'center',
-                  paddingVertical: 14, paddingHorizontal: 4,
-                  borderBottomWidth: 1, borderBottomColor: theme.border,
-                }}>
+                  paddingVertical: 14, paddingHorizontal: 8,
+                  borderRadius: theme.radiusSm,
+                  backgroundColor: pressed ? theme.accentFaint : 'transparent',
+                  borderBottomWidth: 1, borderBottomColor: theme.hairline,
+                })}>
                 <View style={{ flex: 1 }}>
                   <Text style={{
                     color: theme.text, fontSize: 15,

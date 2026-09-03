@@ -1,20 +1,9 @@
-// Edge Function: identify a Pokémon card from a photo.
-//
-// Pipeline: image → Google Cloud Vision OCR (TEXT_DETECTION) → parse the
-// card name + collector number + HP from the recognised text (reading-order
-// lines, not bounding boxes) → search TCGdex by name →
-// score + rank candidates → enrich the top few into the same TcgCard shape
-// the app already consumes. The client confirms the match, so we return a
-// ranked list, never a single guess.
-//
-// Why server-side OCR: keeps the app in Expo Go (no on-device ML / dev
-// build), hides the Vision key, and lets us iterate the parser/matcher
-// without shipping an app release.
+// Edge Function: identify a Pokémon card from a photo. Runs Google Vision
+// OCR, parses name / collector number / HP, then searches TCGdex and returns
+// a ranked candidate list for the client to confirm.
 //
 // Secret required:  supabase secrets set GOOGLE_VISION_API_KEY=...
 // Deploy:           supabase functions deploy card-scan --no-verify-jwt
-// Test standalone:  curl -X POST <fn-url> -H 'Content-Type: application/json' \
-//                     -d "{\"imageBase64\":\"$(base64 -w0 card.jpg)\"}"
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 
@@ -29,11 +18,10 @@ const tcgdexBase = (locale: Locale) => `${TCGDEX_ROOT}/${locale}`;
 const VISION = 'https://vision.googleapis.com/v1/images:annotate';
 
 type Locale = 'en' | 'ja';
-// Hiragana, katakana, or CJK kanji anywhere → treat the card as Japanese and
-// query TCGdex's /ja endpoint.
+// Hiragana, katakana, or CJK kanji anywhere marks the card as Japanese,
+// searched via TCGdex's /ja endpoint.
 const JA_CHARS = /[぀-ヿ一-龯]/;
-// Keep Latin + CJK; used by name cleaning and the similarity normaliser so
-// Japanese names survive instead of being stripped to nothing.
+// Keep Latin + CJK so Japanese names survive cleaning and normalisation.
 const KEEP_NAME = /[^A-Za-z0-9'.\-぀-ヿ一-龯 ]/g;
 const KEEP_NORM = /[^a-z0-9぀-ヿ一-龯]+/g;
 
@@ -44,7 +32,7 @@ interface Vertex { x?: number; y?: number }
 interface TextAnnotation { description: string; boundingPoly?: { vertices: Vertex[] } }
 
 async function runOcr(imageBase64: string, apiKey: string): Promise<TextAnnotation[]> {
-  // Strip a data-URL prefix if the client sent one ("data:image/jpeg;base64,").
+  // Strip a data-URL prefix if present.
   const content = imageBase64.includes(',') ? imageBase64.split(',', 2)[1] : imageBase64;
   const r = await fetch(`${VISION}?key=${apiKey}`, {
     method: 'POST',
@@ -62,27 +50,24 @@ async function runOcr(imageBase64: string, apiKey: string): Promise<TextAnnotati
   const json = await r.json();
   const err = json?.responses?.[0]?.error;
   if (err) throw new Error(`Vision error: ${err.message ?? 'unknown'}`);
-  // textAnnotations[0] is the full block (newline-separated lines, top-to-
-  // bottom) which is all the parser reads; [1..] are per-word boxes (unused).
+  // textAnnotations[0] is the full text block (newline-separated lines,
+  // top-to-bottom); [1..] are per-word boxes.
   return (json?.responses?.[0]?.textAnnotations ?? []) as TextAnnotation[];
 }
 
 // ─────────────────────────────────────────────────────────────
 // Parse name / number / hp out of the OCR text
 // ─────────────────────────────────────────────────────────────
-// Tokens that are never part of a card name. Evolution-stage labels and the
-// HP marker get dropped from any name line.
+// Tokens never part of a card name: evolution-stage labels and the HP marker.
 const SKIP = /^(lv|stage|stage1|stage2|basic|evolves|evolution)\.?$/i;
 const HP_STOP = /^hp$/i;
 
-// Words that appear in the card body, never in a name — "VSTAR Power",
-// "Ability", the rules box, the stat row. Belt-and-suspenders alongside the
-// top-band restriction in nameCandidates.
+// Words from the card body that never appear in a name ("VSTAR Power",
+// "Ability", the rules box, the stat row).
 const BODY_WORD = /^(power|ability|abilities|rule|rules|weakness|resistance|retreat|trait)$/i;
 
-/** Strip a line down to name-like tokens: drop anything with a digit, the
- *  HP label, slashes, stage words, and body words; keep letters + the
- *  punctuation that appears in real names (Mr. Mime, Farfetch'd, Ho-Oh). */
+/** Strip a line down to name-like tokens: drop digits, the HP label, slashes,
+ *  stage and body words; keep punctuation used in real names (Mr. Mime, Ho-Oh). */
 function cleanName(s: string): string {
   return s
     .split(/\s+/)
@@ -93,15 +78,13 @@ function cleanName(s: string): string {
     .trim();
 }
 
-// Japanese stage / evolves-from lines ("○○から進化", "たね", "1進化"). No
-// Pokémon name contains 進化, so dropping these as candidates is safe.
+// Japanese stage / evolves-from lines ("○○から進化", "たね", "1進化");
+// never part of a name.
 const JA_SKIP = /進化|たね/;
 
-// Badge / tag words that print in the card's top-left corner (VSTAR, VMAX,
-// GX…). They also legitimately end a card's title ("Arceus VSTAR"), so we
-// only strip them when LEADING — that's the leaked corner tag; a trailing
-// one is part of the real name. "STAR" is included because OCR commonly
-// reads the VSTAR badge as a bare "STAR".
+// Corner badge words (VSTAR, GX...). Stripped only when leading: a trailing
+// badge is part of the name ("Arceus VSTAR"). OCR often reads the VSTAR
+// badge as a bare "STAR".
 const BADGE = /^(v|vmax|vstar|gx|ex|star|mega|break|legend|prism|radiant|tag|team|prime)\.?$/i;
 
 function stripLeadingBadges(name: string): string {
@@ -110,15 +93,8 @@ function stripLeadingBadges(name: string): string {
   return toks.join(' ');
 }
 
-/** Build an ordered list of name guesses from the OCR text in READING ORDER.
- *  Vision returns lines top-to-bottom regardless of the photo's orientation
- *  (bounding-box y-coords proved unreliable — they put body text "above" the
- *  name), and the card name is among the first lines. So we scan from the top
- *  and stop before descending into rules/attack prose. Stage labels, the HP
- *  line, body words ("VSTAR Power") and multi-word prose are filtered; leading
- *  corner tags are stripped. The handler tries each guess against TCGdex and
- *  keeps the first that matches, so a stray non-name line (no hits) is
- *  harmless. */
+/** Ordered name guesses from the OCR text, scanned top-down in reading order.
+ *  Stray non-name lines are harmless: guesses with no TCGdex hits are skipped. */
 function nameCandidates(annotations: TextAnnotation[]): string[] {
   const fullText = annotations[0]?.description ?? '';
   const out: string[] = [];
@@ -144,33 +120,24 @@ function nameCandidates(annotations: TextAnnotation[]): string[] {
   return uniq.slice(0, 5);
 }
 
-// Subset prefixes for letter-prefixed collector numbers, HARDCODED. The OCR
-// can't be trusted to delimit them — it reads the Crown Zenith set symbol as
-// "M" and glues the regulation mark "F" on, turning "GG56" into "MFGG56". So
-// we look for a KNOWN prefix embedded in the text rather than accepting any
-// leading letters.
-//   GG = Galarian Gallery   TG = Trainer Gallery
-//   SV = Shiny Vault        RC = Radiant Collection
+// Known subset prefixes for lettered collector numbers (Galarian/Trainer
+// Gallery, Shiny Vault, Radiant Collection). OCR glues set symbols and
+// regulation marks onto the number, so only known prefixes embedded in the
+// text are accepted.
 const GALLERY = /(GG|TG|SV|RC)\s*(\d{1,3})/;
 
-// Promo prefixes that print WITHOUT a "/total" denominator (e.g. "SWSH039",
-// "SVP047", "XY12"). Whitelisted so the no-slash branch can't mistake the HP
-// block ("HP210") for a collector number.
+// Promo prefixes that print without a "/total" denominator (e.g. "SWSH039").
+// Whitelisted so the HP block ("HP210") is not mistaken for a number.
 const PROMO_PREFIX = /^(SWSH|SVP|XY|BW|DP|HGSS|PR)$/;
 
-/** Parse the collector number at the card foot into the value used to match
- *  TCGdex's `localId`. Priority order:
- *    1. numeric slash:   167/165 → "167"         (leading zeros stripped)
- *    2. gallery/subset:  …MFGG56/GGZO… → "GG56"  (embedded, hardcoded prefix)
- *    3. promo (no slash): SWSH039 → "SWSH039"    (whitelisted prefix only)
- *  Numeric goes FIRST so a set code like "SV2a" (Japanese cards print it next
- *  to the number) doesn't get mistaken for a gallery "SV2" — the real
- *  "167/165" wins. Gallery cards have no plain N/T form, so they fall through. */
+/** Parse the collector number into TCGdex `localId` form. The numeric
+ *  "167/165" form wins over gallery prefixes so a set code printed near the
+ *  number (e.g. "SV2a") is not misread as a gallery number. */
 function parseCollectorNumber(fullText: string): { number?: string; total?: string } {
   const t = fullText.toUpperCase();
 
-  // No leading \b so a glued regulation mark ("F056/159") doesn't hide it.
-  // Strip leading zeros — TCGdex localIds are unpadded ("56", not "056").
+  // No leading \b: a glued regulation mark ("F056/159") would hide the match.
+  // Leading zeros stripped; TCGdex localIds are unpadded.
   let m = t.match(/(\d{1,3})\s*\/\s*(\d{1,3})\b/);
   if (m) return { number: String(parseInt(m[1], 10)), total: m[2] };
 
@@ -240,25 +207,17 @@ function numberMatches(localId: string, parsed?: string): boolean {
 
 async function searchBriefs(name: string, locale: Locale, localId?: string): Promise<Brief[]> {
   let url = `${tcgdexBase(locale)}/cards?name=${encodeURIComponent(name)}&pagination:page=1&pagination:itemsPerPage=60`;
-  // When we read the collector number, filter by it server-side. TCGdex
-  // string filters are substring matches, so "194" pins the right print
-  // even when a popular name (Rayquaza, Pikachu) has far more than one page
-  // of results — the correct card is otherwise never in the fetched batch.
+  // TCGdex string filters are substring matches; filtering by localId pins
+  // the right print even when a popular name has many pages of results.
   if (localId) url += `&localId=${encodeURIComponent(localId)}`;
   const r = await fetch(url);
   if (!r.ok) throw new Error(`TCGdex search ${r.status}`);
   return (await r.json()) as Brief[];
 }
 
-/** Ordered query attempts for a name guess, broadest-fidelity first:
- *    1. the whole name
- *    2. progressively shorter right-trims (trailing OCR junk)
- *    3. each individual word ≥4 chars (a MISREAD word — typically the
- *       regional prefix: "Hisulan Zoroark" → try "Zoroark")
- *    4. a one-glyph shave of a single word ("Charizardd" → "Charizard")
- *  Callers still SCORE results against the full original name, so trying
- *  "Zoroark" surfaces both base and Hisuian prints but ranks the Hisuian one
- *  first (closer to "Hisuian Zoroark"). */
+/** Ordered query attempts: full name, progressively shorter right-trims,
+ *  single words of 4+ chars, then a one-glyph shave ("Charizardd" →
+ *  "Charizard"). Results are still scored against the full original name. */
 function queryAttempts(name: string): string[] {
   const tokens = name.split(/\s+/).filter(Boolean);
   const tries: string[] = [];
@@ -279,8 +238,8 @@ async function searchWithFallback(name: string, locale: Locale): Promise<{ hits:
   return { hits: [], query: name };
 }
 
-/** Number-filtered search. The localId pins the print, so any attempt that
- *  returns a hit is trustworthy — we don't need a name-similarity gate here. */
+/** Number-filtered search. The localId pins the print, so any hit is
+ *  trustworthy without a name-similarity gate. */
 async function searchNumbered(name: string, locale: Locale, localId: string): Promise<{ hits: Brief[]; query: string }> {
   for (const q of queryAttempts(name)) {
     const hits = await searchBriefs(q, locale, localId);
@@ -351,10 +310,8 @@ serve(async (req: Request) => {
       headers: { ...CORS, 'Content-Type': 'application/json' },
     });
 
-  // One structured trace, optionally emitted as a SINGLE log line so the whole
-  // run is one copy-pasteable row in the Supabase dashboard (Edge Functions →
-  // card-scan → Logs). Silent in production; set the secret SCAN_DEBUG=1 to
-  // turn it on while tuning the parser. Errors always log (force=true).
+  // Structured trace emitted as a single log line. Silent unless the
+  // SCAN_DEBUG secret is set; errors always log (force=true).
   // deno-lint-ignore no-explicit-any
   const trace: Record<string, any> = { attempts: [] };
   const DEBUG = !!Deno.env.get('SCAN_DEBUG');
@@ -376,7 +333,6 @@ serve(async (req: Request) => {
 
     const annotations = await runOcr(imageBase64, apiKey);
     const ocrText = annotations[0]?.description ?? '';
-    // Japanese characters anywhere → search TCGdex's /ja catalogue.
     const locale: Locale = JA_CHARS.test(ocrText) ? 'ja' : 'en';
     trace.ocrAnnotations = annotations.length;
     trace.locale = locale;
@@ -395,11 +351,8 @@ serve(async (req: Request) => {
     let chosen = parsed.name;
     let briefs: Brief[] = [];
 
-    // Pass 1 (precise): if we read a collector number, filter each name guess
-    // by it. This pins the exact print (e.g. Rayquaza #194 = Evolving Skies).
-    // We always SCORE against the full candidate q, so even when a misread
-    // word forces a single-token search ("Zoroark"), the Hisuian print still
-    // ranks above the base one.
+    // Pass 1: filter each name guess by the parsed collector number, which
+    // pins the exact print. Scoring is against the full candidate name.
     if (parsed.number) {
       for (const q of parsed.candidates) {
         const { hits, query } = await searchNumbered(q, locale, parsed.number);
@@ -409,9 +362,8 @@ serve(async (req: Request) => {
       }
     }
 
-    // Pass 2 (broad): no number, or the number-filtered search found nothing
-    // (misread digit). Name-only with the same fallbacks. Accept the first
-    // guess whose results resemble it (sim ≥ 0.5), skipping junk lines.
+    // Pass 2: name-only fallback when there is no number or the numbered
+    // search found nothing. Accepts the first guess with sim >= 0.5 results.
     if (!briefs.length) {
       for (const q of parsed.candidates) {
         const { hits, query } = await searchWithFallback(q, locale);

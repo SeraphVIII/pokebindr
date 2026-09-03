@@ -1,4 +1,4 @@
-// Sparkline — tiny line chart from a number[]. Uses react-native-svg.
+// Tiny line chart rendered with react-native-svg.
 
 import Svg, { Path, Defs, LinearGradient, Stop } from 'react-native-svg';
 import { theme } from '@/lib/theme';

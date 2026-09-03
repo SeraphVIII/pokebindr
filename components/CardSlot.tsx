@@ -1,9 +1,7 @@
-// CardSlot — the visual binder slot.
-// In v1 we just render the real card image from PokemonTCG.io (with status
-// border). The placeholder version from the prototype lives below as
-// EmptySlot for un-acquired cards.
+// Binder card slot with a status-coloured border. EmptySlot is the placeholder.
 
 import { Image, Pressable, View, Text } from 'react-native';
+import { Feather } from '@expo/vector-icons';
 import { theme } from '@/lib/theme';
 import type { CollectionRow, Status } from '@/lib/types';
 
@@ -33,17 +31,15 @@ export function CardSlot({ row, width, onPress, onLongPress }: Props) {
       style={({ pressed }) => ({
         width,
         height: h,
-        borderRadius: Math.max(4, width * 0.07),
-        borderWidth: isReally ? 2.5 : 1.5,
+        borderRadius: Math.max(6, width * 0.08),
+        borderWidth: isReally ? 2 : 1.5,
         borderColor: col,
         backgroundColor: theme.cardBg,
         overflow: 'hidden',
-        transform: [{ scale: pressed ? 0.98 : 1 }],
-        shadowColor: col,
-        shadowOpacity: isReally ? 0.55 : 0.25,
-        shadowRadius: isReally ? 10 : 4,
-        shadowOffset: { width: 0, height: 2 },
-        elevation: isReally ? 8 : 0,
+        transform: [{ scale: pressed ? 0.96 : 1 }],
+        boxShadow: isReally
+          ? `0px 4px 18px rgba(205,99,99,0.40)`
+          : theme.shadowSoft,
       })}
     >
       {row.image_small ? (
@@ -54,37 +50,55 @@ export function CardSlot({ row, width, onPress, onLongPress }: Props) {
         />
       ) : (
         <View style={{
-          flex: 1, alignItems: 'center', justifyContent: 'center',
+          flex: 1, alignItems: 'center', justifyContent: 'center', padding: 6,
         }}>
-          <Text style={{
-            fontFamily: theme.fontDisplay,
-            color: theme.text, fontSize: width * 0.12,
-          }}>{row.card_name}</Text>
+          <Text
+            numberOfLines={3}
+            style={{
+              fontFamily: theme.fontDisplay,
+              color: theme.text, fontSize: Math.max(11, width * 0.11),
+              textAlign: 'center',
+            }}
+          >{row.card_name}</Text>
         </View>
       )}
     </Pressable>
   );
 }
 
-export function EmptySlot({ width, label = '+', onPress }: { width: number; label?: string; onPress?: () => void }) {
+export function EmptySlot({ width, label, onPress }: { width: number; label?: string; onPress?: () => void }) {
   const h = width * 1.4;
+  const discSize = Math.max(22, Math.min(34, width * 0.28));
   return (
     <Pressable
       onPress={onPress}
-      style={{
+      style={({ pressed }) => ({
         width, height: h,
-        borderRadius: Math.max(4, width * 0.07),
-        borderWidth: 1, borderColor: theme.textMute,
+        borderRadius: Math.max(6, width * 0.08),
+        borderWidth: 1, borderColor: theme.hairline,
         borderStyle: 'dashed',
+        backgroundColor: theme.glass,
         alignItems: 'center', justifyContent: 'center',
-        opacity: 0.55,
-      }}
+        gap: 6,
+        opacity: pressed ? 0.85 : 0.65,
+        transform: [{ scale: pressed ? 0.96 : 1 }],
+      })}
     >
-      <Text style={{
-        fontFamily: theme.fontMono,
-        color: theme.textMute,
-        fontSize: Math.max(14, width * 0.22),
-      }}>{label}</Text>
+      {label ? (
+        <Text style={{
+          fontFamily: theme.fontMono,
+          color: theme.textMute,
+          fontSize: Math.max(12, width * 0.16),
+        }}>{label}</Text>
+      ) : (
+        <View style={{
+          width: discSize, height: discSize, borderRadius: theme.pill,
+          backgroundColor: theme.glassStrong,
+          alignItems: 'center', justifyContent: 'center',
+        }}>
+          <Feather name="plus" size={discSize * 0.5} color={theme.textMute} />
+        </View>
+      )}
     </Pressable>
   );
 }

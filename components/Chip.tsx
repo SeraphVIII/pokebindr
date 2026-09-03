@@ -1,6 +1,7 @@
-// Chip — small toggle pill used in filter bars and status pickers.
+// Toggle pill used in filter bars and status pickers.
 
-import { Pressable, Text } from 'react-native';
+import { Text } from 'react-native';
+import { PressableScale } from '@/components/ui';
 import { theme } from '@/lib/theme';
 
 interface Props {
@@ -13,25 +14,28 @@ interface Props {
 export function Chip({ label, active, color, onPress }: Props) {
   const c = color ?? theme.accent;
   return (
-    <Pressable
+    <PressableScale
       onPress={onPress}
+      scaleTo={0.94}
       style={{
         alignSelf: 'flex-start',
-        paddingHorizontal: 10,
-        paddingVertical: 5,
-        borderRadius: 999,
+        paddingHorizontal: 14,
+        paddingVertical: 8,
+        minHeight: 34,
+        justifyContent: 'center',
+        borderRadius: theme.pill,
         borderWidth: 1,
-        borderColor: active ? c : theme.border,
-        backgroundColor: active ? c : 'transparent',
+        borderColor: active ? c : theme.hairline,
+        backgroundColor: active ? `${c}26` : theme.glass,
       }}
     >
       <Text style={{
         fontFamily: theme.fontUIBold,
         fontSize: 11,
-        letterSpacing: 0.5,
+        letterSpacing: 0.6,
         textTransform: 'uppercase',
-        color: active ? theme.accentText : theme.textDim,
+        color: active ? c : theme.textDim,
       }}>{label}</Text>
-    </Pressable>
+    </PressableScale>
   );
 }

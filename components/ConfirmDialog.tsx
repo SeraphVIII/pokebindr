@@ -1,21 +1,19 @@
-// Themed confirmation dialog. Replaces native Alert.alert(... [Cancel, Confirm])
-// so destructive actions match the rest of the app instead of a system-white
-// popup. Mount <ConfirmProvider> once at the root, then call useConfirm() from
-// any screen — it returns an imperative confirm(opts) => Promise<boolean>.
+// Themed confirmation dialog. Mount <ConfirmProvider> once at the root;
+// useConfirm() returns an imperative confirm(opts) => Promise<boolean>.
 
 import { createContext, useCallback, useContext, useRef, useState } from 'react';
-import { Modal, Pressable, Text, View } from 'react-native';
+import { Modal, Text, View } from 'react-native';
 import { theme } from '@/lib/theme';
 import { Eyebrow } from './Eyebrow';
 import { SheetCard } from './SheetCard';
+import { Button } from './ui';
 
 export interface ConfirmOptions {
   title: string;
   message?: string;
   confirmText?: string;
   cancelText?: string;
-  // Tints the confirm button red when true. Use for delete / sign-out / any
-  // action the user can't trivially undo.
+  // Tints the confirm button red.
   destructive?: boolean;
 }
 
@@ -31,8 +29,8 @@ interface PendingConfirm extends ConfirmOptions {
 
 export function ConfirmProvider({ children }: { children: React.ReactNode }) {
   const [pending, setPending] = useState<PendingConfirm | null>(null);
-  // Stash the resolver so close handlers can settle the promise even when the
-  // user dismisses via the OS back button instead of tapping a button.
+  // Resolver kept in a ref so close() can settle the promise on any dismissal
+  // path, including the OS back button.
   const resolverRef = useRef<((ok: boolean) => void) | null>(null);
 
   const confirm = useCallback((opts: ConfirmOptions): Promise<boolean> => {
@@ -59,7 +57,7 @@ export function ConfirmProvider({ children }: { children: React.ReactNode }) {
         onRequestClose={() => close(false)}
       >
         <View style={{
-          flex: 1, backgroundColor: 'rgba(0,0,0,0.6)',
+          flex: 1, backgroundColor: theme.scrim,
           justifyContent: 'center', alignItems: 'center', padding: 24,
         }}>
           <SheetCard
@@ -67,56 +65,40 @@ export function ConfirmProvider({ children }: { children: React.ReactNode }) {
             style={{
               width: '100%', maxWidth: theme.maxContentW - 48,
               backgroundColor: theme.surface,
-              borderWidth: 1, borderColor: theme.borderStrong,
-              borderRadius: theme.radius * 1.5,
-              padding: 20,
+              borderWidth: 1, borderColor: theme.hairline,
+              borderRadius: theme.radiusXl,
+              padding: 24,
+              boxShadow: `${theme.shadowAmbient}, ${theme.shadowInner}`,
             }}
           >
             <Eyebrow>Confirm</Eyebrow>
             <Text style={{
-              fontFamily: theme.fontDisplay, fontSize: 20,
-              color: theme.text, marginTop: 8, lineHeight: 28,
+              fontFamily: theme.fontDisplaySemi, fontSize: 23,
+              color: theme.text, marginTop: 8, lineHeight: 30,
             }}>
               {pending?.title}
             </Text>
             {pending?.message ? (
               <Text style={{
-                color: theme.textDim, fontSize: 13,
-                marginTop: 10, lineHeight: 19,
+                color: theme.textDim, fontSize: 13.5, fontFamily: theme.fontUI,
+                marginTop: 10, lineHeight: 20,
               }}>
                 {pending.message}
               </Text>
             ) : null}
-            <View style={{ flexDirection: 'row', gap: 8, marginTop: 20 }}>
-              <Pressable
+            <View style={{ flexDirection: 'row', gap: 10, marginTop: 24 }}>
+              <Button
+                label={pending?.cancelText ?? 'Cancel'}
+                variant="ghost"
                 onPress={() => close(false)}
-                style={{
-                  flex: 1, padding: 12, borderRadius: theme.radius,
-                  borderWidth: 1, borderColor: theme.border,
-                  alignItems: 'center',
-                }}>
-                <Text style={{
-                  color: theme.textDim, fontFamily: theme.fontUIBold,
-                  fontSize: 12, textTransform: 'uppercase',
-                }}>
-                  {pending?.cancelText ?? 'Cancel'}
-                </Text>
-              </Pressable>
-              <Pressable
+                style={{ flex: 1 }}
+              />
+              <Button
+                label={pending?.confirmText ?? 'Confirm'}
+                variant={pending?.destructive ? 'danger' : 'primary'}
                 onPress={() => close(true)}
-                style={{
-                  flex: 1, padding: 12, borderRadius: theme.radius,
-                  backgroundColor: pending?.destructive ? theme.statusReally : theme.accent,
-                  alignItems: 'center',
-                }}>
-                <Text style={{
-                  color: pending?.destructive ? '#fff' : theme.accentText,
-                  fontFamily: theme.fontUIBold,
-                  fontSize: 12, textTransform: 'uppercase',
-                }}>
-                  {pending?.confirmText ?? 'Confirm'}
-                </Text>
-              </Pressable>
+                style={{ flex: 1 }}
+              />
             </View>
           </SheetCard>
         </View>

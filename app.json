@@ -6,7 +6,6 @@
     "orientation": "portrait",
     "scheme": "pokebindr",
     "userInterfaceStyle": "dark",
-    "newArchEnabled": true,
     "icon": "./assets/icon.png",
     "ios": {
       "supportsTablet": true,
@@ -41,7 +40,9 @@
           "resizeMode": "contain",
           "backgroundColor": "#0c0a08"
         }
-      ]
+      ],
+      "expo-secure-store",
+      "expo-status-bar"
     ],
     "experiments": {
       "typedRoutes": false

@@ -1,9 +1,11 @@
-// SheetCard — animated wrapper for modal panels. Adds a quick slide-up + fade
-// so themed modals don't pop in flat. Use inside <Modal animationType="none">
-// (the Modal itself shouldn't animate; this component owns the entrance).
+// Animated wrapper for modal panels: spring slide-up plus fade.
+// Use inside <Modal animationType="none">; this component owns the entrance.
 
-import { useEffect, useRef } from 'react';
-import { Animated, ViewStyle, StyleProp } from 'react-native';
+import { useEffect } from 'react';
+import { ViewStyle, StyleProp } from 'react-native';
+import Animated, {
+  useSharedValue, useAnimatedStyle, withSpring, withTiming,
+} from 'react-native-reanimated';
 
 interface Props {
   children: React.ReactNode;
@@ -11,22 +13,21 @@ interface Props {
 }
 
 export function SheetCard({ children, style }: Props) {
-  const opacity = useRef(new Animated.Value(0)).current;
-  const translateY = useRef(new Animated.Value(16)).current;
+  const opacity = useSharedValue(0);
+  const translateY = useSharedValue(28);
 
   useEffect(() => {
-    Animated.parallel([
-      Animated.timing(opacity, {
-        toValue: 1, duration: 180, useNativeDriver: true,
-      }),
-      Animated.timing(translateY, {
-        toValue: 0, duration: 220, useNativeDriver: true,
-      }),
-    ]).start();
+    opacity.value = withTiming(1, { duration: 160 });
+    translateY.value = withSpring(0, { damping: 24, stiffness: 300 });
   }, [opacity, translateY]);
 
+  const aStyle = useAnimatedStyle(() => ({
+    opacity: opacity.value,
+    transform: [{ translateY: translateY.value }],
+  }));
+
   return (
-    <Animated.View style={[{ opacity, transform: [{ translateY }] }, style]}>
+    <Animated.View style={[aStyle, style]}>
       {children}
     </Animated.View>
   );

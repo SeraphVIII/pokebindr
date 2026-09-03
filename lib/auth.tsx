@@ -1,5 +1,4 @@
-// Auth context — exposes session + helpers to children.
-// Routes use `useSession()` to gate access.
+// Auth context: session state plus sign-in/out helpers.
 
 import { Session } from '@supabase/supabase-js';
 import {
@@ -29,17 +28,13 @@ export function SessionProvider({ children }: PropsWithChildren) {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
   const queryClient = useQueryClient();
-  // Track which user the cache currently belongs to. Switching users (or
-  // signing out) must clear the cache so e.g. user-scoped queryKeys like
-  // ['profile', 'me'] don't leak rows between accounts.
+  // Query cache owner. Switching accounts or signing out must clear the cache
+  // so user-scoped queryKeys don't leak rows between accounts.
   const cacheUserIdRef = useRef<string | null>(null);
 
   useEffect(() => {
-    // Bootstrap may throw "Invalid Refresh Token" when SecureStore holds a
-    // token whose server-side session was expired or revoked (manual user
-    // delete in the dashboard, long-idle install, etc.). Catch it, force a
-    // sign-out to wipe the bad token, and treat the user as logged-out so
-    // the AuthGate redirects them to /sign-in cleanly instead of looping.
+    // getSession can throw "Invalid Refresh Token" when SecureStore holds a
+    // token revoked server-side; sign out to wipe it and treat as logged out.
     const handleAuthBootError = async (e: unknown) => {
       const msg = (e as { message?: string })?.message ?? String(e);
       const isStaleToken =
@@ -62,9 +57,8 @@ export function SessionProvider({ children }: PropsWithChildren) {
       })
       .catch(handleAuthBootError);
     const { data: sub } = supabase.auth.onAuthStateChange((e, s) => {
-      // TOKEN_REFRESHED with no session means the refresh attempt failed mid-
-      // flight (token revoked while app was running) — clear cache, drop to
-      // signed-out so AuthGate kicks the user back to sign-in.
+      // TOKEN_REFRESHED with no session means the refresh failed mid-flight;
+      // clear the cache and drop to signed-out.
       const nextId = s?.user.id ?? null;
       if (nextId !== cacheUserIdRef.current) {
         queryClient.clear();
@@ -88,12 +82,8 @@ export function SessionProvider({ children }: PropsWithChildren) {
     await supabase.auth.signOut();
   };
   const resetPassword = async (email: string) => {
-    // Point the email link back into the app via the `pokebindr://` scheme so
-    // the recovery flow finishes in-app (app/reset-password.tsx) rather than on
-    // a web page. The resolved URL must be added to Supabase's redirect
-    // allow-list (Authentication → URL Configuration). In a dev client this
-    // resolves to an exp:// URL on your LAN, which is awkward to allow-list —
-    // the deep link works cleanly in a standalone EAS build.
+    // Deep-links the recovery email back into the app (app/reset-password.tsx).
+    // The resolved URL must be on Supabase's redirect allow-list.
     const { error } = await supabase.auth.resetPasswordForEmail(email, {
       redirectTo: Linking.createURL('reset-password'),
     });

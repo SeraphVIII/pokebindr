@@ -1,6 +1,4 @@
-// Root layout — providers + auth gate.
-// Loads fonts, wraps with React-Query + Session contexts, then renders
-// either the (auth) group or the (tabs) group based on session state.
+// Root layout: providers + auth gate.
 
 import { useEffect } from 'react';
 import { Stack, useRouter, useSegments } from 'expo-router';
@@ -42,10 +40,8 @@ function AuthGate({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (loading) return;
     const inAuth = segment0 === '(auth)';
-    // /u/[username]/... and /share/[token] are accessible without an account
-    // so visitors can view shared binders. /reset-password must also render
-    // session-less: the recovery deep link lands here BEFORE we call setSession,
-    // so without this it would bounce to /sign-in before the token is consumed.
+    // /u/*, /share/*, and /reset-password must render session-less; the
+    // recovery deep link lands on /reset-password before setSession runs.
     const inPublic = segment0 === 'u' || segment0 === 'share' || segment0 === 'reset-password';
     if (!session && !inAuth && !inPublic) router.replace('/sign-in');
     else if (session && inAuth) router.replace('/');
@@ -88,13 +84,8 @@ export default function RootLayout() {
               <ConfirmProvider>
                 <StatusBar style="light" />
                 <AuthGate>
-                  {/* Root navigator MUST be Stack, not Slot — Slot renders
-                      child routes as sibling content without push/pop
-                      semantics, so router.back() from any root-level pushed
-                      route (/card/[id], /scan, /collection, …) couldn't find a
-                      previous frame and silently fell back to home. Stack gives
-                      every navigation a real entry to pop. headerShown:false
-                      keeps the existing per-screen custom headers. */}
+                  {/* Must be a Stack, not Slot: Slot gives pushed root routes
+                      no history entry, so router.back() falls through to home. */}
                   <Stack screenOptions={{
                     headerShown: false,
                     contentStyle: { backgroundColor: theme.bg },

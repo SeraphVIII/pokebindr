@@ -9,6 +9,7 @@ import { useRouter } from 'expo-router';
 import { Feather } from '@expo/vector-icons';
 import { Screen } from '@/components/Screen';
 import { Eyebrow } from '@/components/Eyebrow';
+import { Button, IconDisc } from '@/components/ui';
 import { useCreateBinder } from '@/lib/queries';
 import { useToast } from '@/components/Toast';
 import { theme } from '@/lib/theme';
@@ -57,21 +58,18 @@ export default function NewBinder() {
         style={{ flex: 1 }}
       >
         <View style={{ paddingHorizontal: 14, paddingTop: 6 }}>
-          <Pressable onPress={() => router.back()} hitSlop={12}>
-            <Feather name="arrow-left" size={22} color={theme.textDim} />
-          </Pressable>
+          <IconDisc name="chevron-left" onPress={() => router.back()} />
         </View>
 
         <ScrollView contentContainerStyle={{ padding: 24, paddingBottom: 32 }}>
           <Eyebrow>New binder</Eyebrow>
           <Text style={{
-            fontFamily: theme.fontDisplay,
-            fontSize: 30, color: theme.text, marginTop: 4, lineHeight: 40,
+            fontFamily: theme.fontDisplaySemi,
+            fontSize: 30, color: theme.text, marginTop: 4, lineHeight: 38,
           }}>Set it up</Text>
 
-          {/* name */}
-          <View style={{ marginTop: 22 }}>
-            <Eyebrow style={{ marginBottom: 6 }}>Name</Eyebrow>
+          <View style={{ marginTop: 24 }}>
+            <Eyebrow style={{ marginBottom: 8 }}>Name</Eyebrow>
             <TextInput
               value={name}
               onChangeText={setName}
@@ -79,18 +77,18 @@ export default function NewBinder() {
               placeholderTextColor={theme.textMute}
               autoFocus
               style={{
-                backgroundColor: theme.surface,
-                borderWidth: 1, borderColor: theme.border,
+                backgroundColor: theme.glass,
+                borderWidth: 1, borderColor: theme.hairline,
                 borderRadius: theme.radius,
-                padding: 14, fontSize: 15,
+                paddingHorizontal: 16, paddingVertical: 14, fontSize: 15,
                 color: theme.text, fontFamily: theme.fontUI,
+                boxShadow: theme.shadowInner,
               }}
             />
           </View>
 
-          {/* size */}
-          <View style={{ marginTop: 22 }}>
-            <Eyebrow style={{ marginBottom: 6 }}>Grid size</Eyebrow>
+          <View style={{ marginTop: 24 }}>
+            <Eyebrow style={{ marginBottom: 8 }}>Grid size</Eyebrow>
             <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
               {SIZES.map((s, i) => {
                 const active = i === sizeIdx;
@@ -98,16 +96,17 @@ export default function NewBinder() {
                   <Pressable
                     key={s.label}
                     onPress={() => setSizeIdx(i)}
-                    style={{
-                      paddingHorizontal: 14, paddingVertical: 10,
+                    style={({ pressed }) => ({
+                      paddingHorizontal: 16, paddingVertical: 11,
                       borderRadius: theme.radius,
                       borderWidth: 1,
-                      borderColor: active ? theme.accent : theme.border,
-                      backgroundColor: active ? theme.accent : 'transparent',
-                    }}>
+                      borderColor: active ? theme.accent : theme.hairline,
+                      backgroundColor: active ? theme.accentSoft : theme.glass,
+                      transform: [{ scale: pressed ? 0.95 : 1 }],
+                    })}>
                     <Text style={{
                       fontFamily: theme.fontMono, fontSize: 13,
-                      color: active ? theme.accentText : theme.textDim,
+                      color: active ? theme.accent : theme.textDim,
                       letterSpacing: 0.5,
                     }}>{s.label}</Text>
                   </Pressable>
@@ -122,7 +121,6 @@ export default function NewBinder() {
             </Text>
           </View>
 
-          {/* pages */}
           <View style={{ marginTop: 22 }}>
             <Eyebrow style={{ marginBottom: 6 }}>Initial pages</Eyebrow>
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
@@ -138,21 +136,13 @@ export default function NewBinder() {
             </View>
           </View>
 
-          <Pressable
+          <Button
+            label="Create binder"
+            icon="arrow-right"
             onPress={submit}
             disabled={create.isPending}
-            style={{
-              marginTop: 32,
-              backgroundColor: theme.accent,
-              padding: 16, borderRadius: theme.radius,
-              opacity: create.isPending ? 0.6 : 1,
-            }}>
-            <Text style={{
-              color: theme.accentText, textAlign: 'center',
-              fontFamily: theme.fontUIBold, fontSize: 14,
-              letterSpacing: 0.5, textTransform: 'uppercase',
-            }}>Create binder</Text>
-          </Pressable>
+            style={{ marginTop: 32 }}
+          />
         </ScrollView>
       </KeyboardAvoidingView>
     </Screen>
@@ -168,9 +158,10 @@ function Stepper({ value, onChange, min, max }: {
   return (
     <View style={{
       flexDirection: 'row', alignItems: 'center',
-      backgroundColor: theme.surface,
-      borderWidth: 1, borderColor: theme.border,
-      borderRadius: theme.radius,
+      backgroundColor: theme.glass,
+      borderWidth: 1, borderColor: theme.hairline,
+      borderRadius: theme.pill,
+      boxShadow: theme.shadowInner,
     }}>
       <Pressable onPress={dec} hitSlop={6} style={{ padding: 12 }}>
         <Feather name="minus" size={14} color={theme.text} />

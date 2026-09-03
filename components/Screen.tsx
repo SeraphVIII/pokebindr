@@ -1,6 +1,5 @@
-// Screen — full-bleed container with the Vault background + safe-area
-// padding, used by every route. Desktop max-width centering is applied
-// once at the root layout, so Screen itself stays simple.
+// Full-bleed route container with app background and safe-area padding.
+// Max-width centering is handled by the root layout, not here.
 
 import { PropsWithChildren } from 'react';
 import { View, ViewStyle } from 'react-native';
